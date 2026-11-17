@@ -7,25 +7,12 @@ void HeltecV4Board::begin() {
     pinMode(PIN_ADC_CTRL, OUTPUT);
     digitalWrite(PIN_ADC_CTRL, LOW); // Initially inactive
 
-    // Set up digital GPIO registers before releasing RTC hold. The hold latches
-    // the pad state including function select, so register writes accumulate
-    // without affecting the pad. On hold release, all changes apply atomically
-    // (IO MUX switches to digital GPIO with output already HIGH — no glitch).
-    pinMode(P_LORA_PA_POWER, OUTPUT);
-    digitalWrite(P_LORA_PA_POWER,HIGH);
-    rtc_gpio_hold_dis((gpio_num_t)P_LORA_PA_POWER);
-
-    pinMode(P_LORA_PA_EN, OUTPUT);
-    digitalWrite(P_LORA_PA_EN,HIGH);
-    rtc_gpio_hold_dis((gpio_num_t)P_LORA_PA_EN);
-    pinMode(P_LORA_PA_TX_EN, OUTPUT);
-    digitalWrite(P_LORA_PA_TX_EN,LOW);
+    // Front-end module: V4 boards use a GC1109, V4.3 boards a KCT8103L with a different
+    // TX/RX control pin. init() detects which (GPIO2 pull level) and powers it up.
+    // (Ported from upstream MeshCore "add heltec v4.3".)
+    loRaFEMControl.init();
 
     esp_reset_reason_t reason = esp_reset_reason();
-    if (reason != ESP_RST_DEEPSLEEP) {
-      delay(1);  // GC1109 startup time after cold power-on
-    }
-
     periph_power.begin();
     if (reason == ESP_RST_DEEPSLEEP) {
       long wakeup_source = esp_sleep_get_ext1_wakeup_status();
@@ -40,12 +27,12 @@ void HeltecV4Board::begin() {
 
   void HeltecV4Board::onBeforeTransmit(void) {
     digitalWrite(P_LORA_TX_LED, HIGH);   // turn TX LED on
-    digitalWrite(P_LORA_PA_TX_EN,HIGH);
+    loRaFEMControl.setTxModeEnable();
   }
 
   void HeltecV4Board::onAfterTransmit(void) {
     digitalWrite(P_LORA_TX_LED, LOW);   // turn TX LED off
-    digitalWrite(P_LORA_PA_TX_EN,LOW);
+    loRaFEMControl.setRxModeEnable();
   }
 
   void HeltecV4Board::enterDeepSleep(uint32_t secs, int pin_wake_btn) {
@@ -57,9 +44,7 @@ void HeltecV4Board::begin() {
 
     rtc_gpio_hold_en((gpio_num_t)P_LORA_NSS);
 
-    // Hold GC1109 FEM pins during sleep to keep LNA active for RX wake
-    rtc_gpio_hold_en((gpio_num_t)P_LORA_PA_POWER);
-    rtc_gpio_hold_en((gpio_num_t)P_LORA_PA_EN);
+    loRaFEMControl.setRxModeEnableWhenMCUSleep();   // keep the FEM in RX for wake-on-packet
 
     if (pin_wake_btn < 0) {
       esp_sleep_enable_ext1_wakeup( (1L << P_LORA_DIO_1), ESP_EXT1_WAKEUP_ANY_HIGH);  // wake up on: recv LoRa packet
@@ -96,8 +81,8 @@ void HeltecV4Board::begin() {
 
   const char* HeltecV4Board::getManufacturerName() const {
   #ifdef HELTEC_LORA_V4_TFT
-    return "Heltec V4 TFT";
+    return loRaFEMControl.getFEMType() == KCT8103L_PA ? "Heltec V4.3 TFT" : "Heltec V4 TFT";
   #else
-    return "Heltec V4 OLED";
+    return loRaFEMControl.getFEMType() == KCT8103L_PA ? "Heltec V4.3 OLED" : "Heltec V4 OLED";
   #endif
   }

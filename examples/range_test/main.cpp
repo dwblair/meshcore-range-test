@@ -1370,6 +1370,7 @@ public:
     Serial.println();
     Serial.println("===== MeshCore range_test =====");
     Serial.println(FIRMWARE_VER_TEXT);
+    Serial.printf("Board: %s\n", board.getManufacturerName());
     Serial.printf("Node: %s (id %u)  role: %s  mode: %s\n", _prefs.node_name, (unsigned)_prefs.node_id,
                   roleName(_prefs.role), modeName(_prefs.mode));
     Serial.print("Public key: "); mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE); Serial.println();
@@ -1404,6 +1405,7 @@ public:
 
   void printStatus() {
     Position p = getPosition();
+    Serial.printf("   board: %s\n", board.getManufacturerName());
     Serial.printf("   node: %s (id %u, key %s)  role=%s mode=%s repeat=%s\n", _prefs.node_name,
                   (unsigned)_prefs.node_id, self_key, roleName(_prefs.role), modeName(_prefs.mode), _prefs.repeat ? "on" : "off");
     Serial.printf("   position: %s", fixName(p.src));

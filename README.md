@@ -69,6 +69,19 @@ Radio settings are the US public MeshCore preset (910.525 MHz, BW 62.5, SF7, CR5
 so existing community repeaters can carry the traffic. A new node generates its
 identity on first boot.
 
+**Heltec V4 flashing quirks:**
+- **After flashing, tap RST.** With esptool 4.5 the board stays in the bootloader
+  after an upload over its built-in USB.
+- **If the upload fails** with `OSError: [Errno 71] Protocol error`, hold PRG, tap
+  RST, release PRG, then upload again. A different cable or port also helps.
+
+Settings, contacts and targets live in flash and survive reflashing.
+
+**Heltec V4.3 boards** use a different RF front end (KCT8103L instead of the
+GC1109). This tree includes upstream MeshCore's auto-detection
+(`variants/heltec_v4/LoRaFEMControl.*`), and `status` prints which board was found.
+Without it, a V4.3 receives about 50 dB below normal.
+
 ## Setup (once, with all nodes on your desk)
 
 **1. Create a Bayou feed** at <https://bayou.pvos.org> and note its public and
