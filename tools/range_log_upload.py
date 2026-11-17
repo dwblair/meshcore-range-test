@@ -63,7 +63,7 @@ def line_to_row(line, private_key, mark_uploaded=True):
         return None
 
     row = {"private_key": private_key}
-    id_key = {"ping": "sid", "adv": "rid"}.get(kind, "id")
+    id_key = {"ping": "sid", "adv": "rid", "nbr": "rid"}.get(kind, "id")
 
     def num(key, col):
         v = kv.get(key)
@@ -79,9 +79,11 @@ def line_to_row(line, private_key, mark_uploaded=True):
         num("snr_f", "aux_1")
         num("rssi_f", "rssi")
         num("snr_r", "aux_2")
-    elif kind == "adv":
+    elif kind in ("adv", "nbr"):
         num("snr", "aux_1")
         num("rssi", "rssi")
+        if kind == "nbr":
+            num("n", "aux_2")
     hops = kv.get("hops")
     if hops is not None and is_number(hops) and not hops.startswith("-"):
         row["aux_3"] = int(hops)

@@ -101,12 +101,14 @@
 #define STATUS_DEFAULT_INTERVAL   3600         // seconds
 #define ADVERT_FLOOD_INTERVAL_MS  (12UL*3600UL*1000UL)
 #define ADV_POST_MIN_INTERVAL_MS  (6UL*3600UL*1000UL)
-#define POST_QUEUE_SIZE           16
+#define POST_QUEUE_SIZE           40           // hourly burst: status + up to MAX_NBR_ROWS nbr rows
+#define MAX_NBR_ROWS              16           // busiest neighbours posted per summary
 #define LINE_MAX                  300
 #define SEQ_BLOCK                 50
 #define TIME_VALID_MIN            1735689600UL // 2025-01-01: earlier = clock never synced
 #define CONTACTS_SAVE_DELAY_MS    30000UL
 #define FLOOD_FORWARD_MAX_HOPS    16
+#define MAX_NBRS                  32
 #define MSG_PREFIX                "[RANGE]"
 
 #include <helpers/BaseChatMesh.h>
@@ -124,13 +126,16 @@
 
 enum { ROLE_RECEIVER = 0, ROLE_SENDER = 1 };
 enum { MODE_DIRECT = 0, MODE_ROUTED = 1 };
-enum { POS_NONE = 0, POS_MANUAL = 1, POS_GPS = 2 };
+enum { POS_NONE = 0, POS_MANUAL = 1, POS_GPS = 2, POS_LAST = 3 };
+#define SENDER_LAST_FIX_MAX_MS  60000UL   // a moving sender may reuse its last fix only briefly
 enum { ROUTE_ZH = 0, ROUTE_FL = 1, ROUTE_DR = 2 };
 enum { RES_NONE = 0, RES_PENDING, RES_OK, RES_TIMEOUT, RES_FAIL, RES_NOCONTACT, RES_SKIPPED };
 
 static const char* roleName(uint8_t r)  { return r == ROLE_SENDER ? "sender" : "receiver"; }
 static const char* modeName(uint8_t m)  { return m == MODE_ROUTED ? "routed" : "direct"; }
-static const char* fixName(uint8_t s)   { return s == POS_GPS ? "gps" : (s == POS_MANUAL ? "man" : "none"); }
+static const char* fixName(uint8_t s) {
+  return s == POS_GPS ? "gps" : s == POS_LAST ? "last" : s == POS_MANUAL ? "man" : "none";
+}
 static const char* routeName(uint8_t r) { return r == ROUTE_FL ? "fl" : (r == ROUTE_DR ? "dr" : "zh"); }
 
 static void toHexLower(char* dst, const uint8_t* src, int n) {
@@ -293,9 +298,26 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   char ss_dst_name[20];
   char ss_dst_key[9];
 
-  // last received packet (stashed in logRx, before dispatch)
+  // last received packet (stashed in logRxRaw/logRx, before dispatch)
   float last_rx_snr, last_rx_rssi;
   unsigned long last_rx_millis;
+
+  // Direct neighbours: every flood packet we hear ends its path with the hash of the node
+  // that just transmitted it, so each copy tells us one repeater we hear directly, and how
+  // well. Aggregated per status interval and posted as k=nbr rows (no packet contents).
+  struct NbrStat {
+    uint8_t hash[3];
+    uint8_t hsz;
+    uint16_t n;
+    float snr_sum, snr_min, snr_max;
+    float rssi_sum;
+    uint16_t rssi_n;
+    unsigned long last_at;
+  };
+  NbrStat nbrs[MAX_NBRS];
+  uint8_t nbr_count;
+  uint16_t nbr_overflow;
+  unsigned long nbr_window_start;
 
   // receiver stats (display)
   char rx_from[20];
@@ -304,6 +326,11 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   char rx_mode[4];
   unsigned long rx_at;
   uint32_t rx_count;
+
+  // last GPS fix since boot (RAM only, see getPosition)
+  Position last_fix;
+  unsigned long last_fix_at;
+  bool has_last_fix;
 
   // flash log
   uint32_t log_bytes, log_lines_boot;
@@ -529,6 +556,13 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
 
   /* ---------------- position / time / battery ---------------- */
 
+  // Position, best source first:
+  //   1. live GPS fix                                   fix=gps
+  //   2. last GPS fix since THIS boot (GPS dropout)     fix=last  (sender: only for 60 s)
+  //   3. the configured position (set lat/lon)          fix=man
+  // The last fix is deliberately not kept across reboots: a node that was moved has been
+  // power-cycled, and a persisted fix would put it back where it used to be (e.g. on the
+  // desk at the other house) until GPS reacquires. Use `set pos gps` to store a fix.
   Position getPosition() {
     Position p;
     memset(&p, 0, sizeof(p));
@@ -541,10 +575,20 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
         p.lat = ((double)lp->getLatitude()) / 1000000.0;
         p.lon = ((double)lp->getLongitude()) / 1000000.0;
         p.alt = (int)(lp->getAltitude() / 1000);
+        last_fix = p;
+        last_fix_at = millis();
+        has_last_fix = true;
         return p;
       }
     }
   #endif
+    if (has_last_fix && (_prefs.role != ROLE_SENDER || millis() - last_fix_at < SENDER_LAST_FIX_MAX_MS)) {
+      int sats = p.sats;
+      p = last_fix;
+      p.src = POS_LAST;
+      p.sats = sats;
+      return p;
+    }
     if (_prefs.has_fixed_pos) {
       p.src = POS_MANUAL;
       p.lat = ((double)_prefs.fixed_lat_e6) / 1000000.0;
@@ -679,7 +723,8 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     JsonLine J;
     J.add("{\"private_key\":\"%s\"", _prefs.bayou_private_key);
 
-    const char* id_key = strcmp(kind, "ping") == 0 ? "sid" : (strcmp(kind, "adv") == 0 ? "rid" : "id");
+    const char* id_key = strcmp(kind, "ping") == 0 ? "sid"
+                       : (strcmp(kind, "adv") == 0 || strcmp(kind, "nbr") == 0) ? "rid" : "id";
     if (kvGet(line, id_key, v, sizeof(v)) && isNumber(v)) J.add(",\"node_id\":%s", v);
     if (kvGet(line, "lat", v, sizeof(v)) && isNumber(v)) J.add(",\"gps_lat\":%s", v);
     if (kvGet(line, "lon", v, sizeof(v)) && isNumber(v)) J.add(",\"gps_lon\":%s", v);
@@ -689,9 +734,10 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
       if (kvGet(line, "snr_f", v, sizeof(v)) && isNumber(v)) J.add(",\"aux_1\":%s", v);
       if (kvGet(line, "rssi_f", v, sizeof(v)) && isNumber(v)) J.add(",\"rssi\":%s", v);
       if (kvGet(line, "snr_r", v, sizeof(v)) && isNumber(v)) J.add(",\"aux_2\":%s", v);
-    } else if (strcmp(kind, "adv") == 0) {
+    } else if (strcmp(kind, "adv") == 0 || strcmp(kind, "nbr") == 0) {
       if (kvGet(line, "snr", v, sizeof(v)) && isNumber(v)) J.add(",\"aux_1\":%s", v);
       if (kvGet(line, "rssi", v, sizeof(v)) && isNumber(v)) J.add(",\"rssi\":%s", v);
+      if (kind[0] == 'n' && kvGet(line, "n", v, sizeof(v)) && isNumber(v)) J.add(",\"aux_2\":%s", v);
     }
     if (kvGet(line, "hops", v, sizeof(v)) && isNumber(v) && v[0] != '-') J.add(",\"aux_3\":%s", v);
 
@@ -793,6 +839,119 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   bool bayouConfigured() const { return false; }
 #endif
 
+  /* ---------------- direct neighbours ---------------- */
+
+  static bool rssiValid(float rssi) { return rssi < -1.0f; }   // 0 = register read after RX restarted
+
+  void recordNeighbour(const uint8_t* hash, uint8_t hsz) {
+    NbrStat* e = NULL;
+    for (uint8_t i = 0; i < nbr_count; i++) {
+      if (nbrs[i].hsz == hsz && memcmp(nbrs[i].hash, hash, hsz) == 0) { e = &nbrs[i]; break; }
+    }
+    if (!e) {
+      if (nbr_count >= MAX_NBRS) { nbr_overflow++; return; }
+      e = &nbrs[nbr_count++];
+      memset(e, 0, sizeof(*e));
+      memcpy(e->hash, hash, hsz);
+      e->hsz = hsz;
+      e->snr_min = 99; e->snr_max = -99;
+    }
+    e->n++;
+    e->snr_sum += last_rx_snr;
+    if (last_rx_snr < e->snr_min) e->snr_min = last_rx_snr;
+    if (last_rx_snr > e->snr_max) e->snr_max = last_rx_snr;
+    if (rssiValid(last_rx_rssi)) { e->rssi_sum += last_rx_rssi; e->rssi_n++; }
+    e->last_at = millis();
+  }
+
+  // The same repeater shows up under 1-, 2- and 3-byte hashes (senders choose the path hash
+  // size), e.g. 35 / 3582 / 358276. Fold each shorter hash into the longest entry it prefixes,
+  // unless the longer entries it prefixes disagree (then it's ambiguous and stays separate).
+  void foldNeighbours() {
+    for (uint8_t i = 0; i < nbr_count; i++) {
+      NbrStat& s = nbrs[i];
+      if (s.n == 0) continue;
+      int best = -1;
+      bool ambiguous = false;
+      for (uint8_t j = 0; j < nbr_count && !ambiguous; j++) {
+        const NbrStat& c = nbrs[j];
+        if (j == i || c.n == 0 || c.hsz <= s.hsz || memcmp(c.hash, s.hash, s.hsz) != 0) continue;
+        if (best < 0) { best = j; continue; }
+        const NbrStat& b = nbrs[best];
+        uint8_t m = b.hsz < c.hsz ? b.hsz : c.hsz;
+        if (memcmp(b.hash, c.hash, m) != 0) ambiguous = true;
+        else if (c.hsz > b.hsz) best = j;
+      }
+      if (best < 0 || ambiguous) continue;
+      NbrStat& d = nbrs[best];
+      d.n += s.n;
+      d.snr_sum += s.snr_sum;
+      if (s.snr_min < d.snr_min) d.snr_min = s.snr_min;
+      if (s.snr_max > d.snr_max) d.snr_max = s.snr_max;
+      d.rssi_sum += s.rssi_sum;
+      d.rssi_n += s.rssi_n;
+      if ((long)(s.last_at - d.last_at) > 0) d.last_at = s.last_at;
+      s.n = 0;   // folded
+    }
+    // compact
+    uint8_t k = 0;
+    for (uint8_t i = 0; i < nbr_count; i++) if (nbrs[i].n) nbrs[k++] = nbrs[i];
+    nbr_count = k;
+  }
+
+  void sortNeighboursByCount() {
+    for (uint8_t i = 1; i < nbr_count; i++) {
+      NbrStat t = nbrs[i];
+      int j = i - 1;
+      while (j >= 0 && nbrs[j].n < t.n) { nbrs[j + 1] = nbrs[j]; j--; }
+      nbrs[j + 1] = t;
+    }
+  }
+
+  void printNeighbours() {
+    foldNeighbours();
+    sortNeighboursByCount();
+    unsigned long span = (millis() - nbr_window_start) / 1000;
+    Serial.printf("   direct neighbours heard in the last %lus (from flood traffic):\n", span);
+    if (nbr_count == 0) { Serial.println("   (none yet)"); return; }
+    for (uint8_t i = 0; i < nbr_count; i++) {
+      const NbrStat& e = nbrs[i];
+      char h[8];
+      toHexLower(h, e.hash, e.hsz);
+      Serial.printf("   %-6s n=%-4u snr avg %+.1f (min %+.1f max %+.1f)", h, (unsigned)e.n, e.snr_sum / e.n, e.snr_min, e.snr_max);
+      if (e.rssi_n) Serial.printf("  rssi %.0f", e.rssi_sum / e.rssi_n);
+      Serial.printf("  last %lus ago\n", (millis() - e.last_at) / 1000);
+    }
+    if (nbr_overflow) Serial.printf("   (+%u packets from neighbours beyond the %d tracked)\n", (unsigned)nbr_overflow, MAX_NBRS);
+  }
+
+  // One k=nbr row per neighbour heard since the last summary (busiest first, capped), then
+  // start a new window.
+  void emitNeighbours() {
+    foldNeighbours();
+    sortNeighboursByCount();
+    if (nbr_count > 0) {
+      char me[20];
+      sanitizeName(me, sizeof(me), _prefs.node_name);
+      unsigned long span = (millis() - nbr_window_start) / 1000;
+      for (uint8_t i = 0; i < nbr_count && i < MAX_NBR_ROWS; i++) {
+        const NbrStat& e = nbrs[i];
+        char h[8];
+        toHexLower(h, e.hash, e.hsz);
+        Line L;
+        L.add("k=nbr v=1 t=%lu rep=%s rid=%u rk=%s hash=%s n=%u snr=%.2f snr_min=%.2f snr_max=%.2f",
+              (unsigned long)nowUnix(), me, (unsigned)_prefs.node_id, self_key, h, (unsigned)e.n,
+              e.snr_sum / e.n, e.snr_min, e.snr_max);
+        if (e.rssi_n) L.add(" rssi=%d", (int)lroundf(e.rssi_sum / e.rssi_n));
+        L.add(" span=%lu", span);
+        recordEvent(L.s);
+      }
+    }
+    nbr_count = 0;
+    nbr_overflow = 0;
+    nbr_window_start = millis();
+  }
+
   /* ---------------- status + repeater adverts (posted by Wi-Fi nodes) ---------------- */
 
   void emitStatus() {
@@ -820,6 +979,10 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
       if (next_status_at == 0) next_status_at = now + 15000;
       return;
     }
+    // Neighbour summary rides along with the status row (skip a near-empty window at boot).
+    // Status goes last: if the post queue ever overflows it drops the OLDEST rows, and the
+    // status row is what puts this station on the map.
+    if (now - nbr_window_start >= 5UL * 60UL * 1000UL) emitNeighbours();
     emitStatus();
     next_status_at = now + _prefs.status_interval_secs * 1000UL;
   }
@@ -853,10 +1016,10 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     keyHex(k, c.id.pub_key);
     formatPath(pth, sizeof(pth), path, path_len, 8);
     Line L;
-    L.add("k=adv v=1 t=%lu rep=%s rid=%u rk=%s name=%s key=%s type=%s hops=%d path=%s snr=%.2f rssi=%d",
+    L.add("k=adv v=1 t=%lu rep=%s rid=%u rk=%s name=%s key=%s type=%s hops=%d path=%s snr=%.2f",
           (unsigned long)nowUnix(), me, (unsigned)_prefs.node_id, self_key, nm, k,
-          c.type == ADV_TYPE_REPEATER ? "rpt" : "room", (int)(path_len & 63), pth,
-          last_rx_snr, (int)lroundf(last_rx_rssi));
+          c.type == ADV_TYPE_REPEATER ? "rpt" : "room", (int)(path_len & 63), pth, last_rx_snr);
+    if (rssiValid(last_rx_rssi)) L.add(" rssi=%d", (int)lroundf(last_rx_rssi));
     if (has_pos) L.add(" lat=%.6f lon=%.6f", c.gps_lat / 1000000.0, c.gps_lon / 1000000.0);
     recordEvent(L.s);
   }
@@ -969,7 +1132,11 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     L.add("k=ping v=1 t=%lu src=%s sid=%u sk=%s dst=%s did=0 dk=%s seq=%lu m=%s res=%s fix=%s hops=%d path=%s",
           (unsigned long)cycle_t, me, (unsigned)_prefs.node_id, self_key, ss_dst_name, ss_dst_key,
           (unsigned long)cycle_seq, routeName(ss_route), res, fixName(cycle_pos.src), hops, path);
-    if (with_ack) L.add(" snr_r=%.2f rssi_r=%d rtt=%lu", ts.ack_snr, (int)ts.ack_rssi, (unsigned long)ts.rtt_ms);
+    if (with_ack) {
+      L.add(" snr_r=%.2f", ts.ack_snr);
+      if (rssiValid(ts.ack_rssi)) L.add(" rssi_r=%d", (int)ts.ack_rssi);
+      L.add(" rtt=%lu", (unsigned long)ts.rtt_ms);
+    }
     L.add(" b=%.2f", cycle_batt);
     addPosition(L, cycle_pos);
     recordEvent(L.s);
@@ -1097,7 +1264,9 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     L.add("k=ping v=1 t=%lu src=%s sid=%s sk=%s dst=%s did=%u dk=%s seq=%s m=%s res=rx fix=%s hops=%d path=%s",
           (unsigned long)t, src, isNumber(v_sid) ? v_sid : "0", sk, me, (unsigned)_prefs.node_id, self_key,
           isNumber(v_seq) ? v_seq : "0", mode, v_fix, hops, path);
-    L.add(" snr_f=%.2f rssi_f=%d b=%s", snr, (int)lroundf(last_rx_rssi), isNumber(v_b) ? v_b : "0");
+    L.add(" snr_f=%.2f", snr);
+    if (rssiValid(last_rx_rssi)) L.add(" rssi_f=%d", (int)lroundf(last_rx_rssi));
+    L.add(" b=%s", isNumber(v_b) ? v_b : "0");
     if (has_pos) L.add(" lat=%s lon=%s alt=%s", v_lat, v_lon, v_alt);
     recordEvent(L.s);
 
@@ -1156,10 +1325,19 @@ protected:
     return true;
   }
 
+  // Called by the Dispatcher straight after the radio hands over a packet: the only
+  // reliable moment to read its RSSI (once RX restarts the register can read 0).
+  void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override {
+    last_rx_rssi = rssi;
+  }
+
   void logRx(mesh::Packet* packet, int len, float score) override {
     last_rx_snr = packet->getSNR();
-    last_rx_rssi = _radio->getLastRSSI();
     last_rx_millis = millis();
+    if (packet->isRouteFlood() && packet->getPathHashCount() > 0) {
+      uint8_t hsz = packet->getPathHashSize();
+      if (hsz >= 1 && hsz <= 3) recordNeighbour(&packet->path[(packet->getPathHashCount() - 1) * hsz], hsz);
+    }
   }
 
   bool shouldOverwriteWhenFull() const override { return true; }
@@ -1239,6 +1417,8 @@ public:
     expected_ack = 0; ss_route = ROUTE_ZH; ss_fwd_hops = 0;
     ss_fwd_path[0] = 0; ss_dst_name[0] = 0; ss_dst_key[0] = 0;
     last_rx_snr = 0; last_rx_rssi = 0; last_rx_millis = 0;
+    nbr_count = 0; nbr_overflow = 0; nbr_window_start = 0;
+    memset(&last_fix, 0, sizeof(last_fix)); last_fix_at = 0; has_last_fix = false;
     rx_from[0] = 0; rx_snr = 0; rx_rssi = 0; rx_hops = 0; rx_mode[0] = 0; rx_at = 0; rx_count = 0;
     log_bytes = 0; log_lines_boot = 0; log_full = false;
     contacts_save_at = 0;
@@ -1287,6 +1467,7 @@ public:
   const char* getWifiStatus() const { return wifi_status; }
   const char* getPostStatus() const { return post_status; }
   uint8_t getQueueLen() const { return q_count; }
+  uint8_t getNbrCount() const { return nbr_count; }
   bool wifiConfigured() const { return _prefs.wifi_ssid[0] != 0; }
 #endif
 
@@ -1449,6 +1630,7 @@ public:
     Serial.println("   target add|remove <name>     - add/remove a target (max 4)");
     Serial.println("   target clear                 - remove all targets");
     Serial.println("   send                         - run one send cycle now");
+    Serial.println("   nbr                          - repeaters heard directly (since last summary)");
     Serial.println("   advert [flood]               - send advert (zero hop, or flood)");
     Serial.println("   log | log dump | log clear   - flash log size / print all / erase");
     Serial.println("   set role sender|receiver     - apply role defaults (see README)");
@@ -1460,6 +1642,7 @@ public:
     Serial.println("   set log on|off               - log send/receive events to flash");
     Serial.println("   set display on|auto          - keep OLED on, or auto-off after 60 s");
     Serial.println("   set lat <deg> / set lon <deg> / set alt <m>  - fixed position (used without GPS fix)");
+    Serial.println("   set pos gps                  - store the current GPS fix as the fixed position");
     Serial.println("   set pos clear                - forget the fixed position");
   #if HAS_WIFI
     Serial.println("   set wifi_ssid <ssid> / set wifi_password <pwd>  (reboot to apply)");
@@ -1530,6 +1713,15 @@ public:
       _prefs.fixed_alt_m = (int16_t)atoi(&config[4]);
       savePrefs();
       Serial.printf("   OK, fixed alt = %dm\n", (int)_prefs.fixed_alt_m);
+    } else if (strcmp(config, "pos gps") == 0) {   // store the current GPS fix as the configured position
+      Position p = getPosition();
+      if (p.src != POS_GPS) { Serial.println("   ERROR: no live GPS fix right now (see 'status')"); return; }
+      _prefs.fixed_lat_e6 = (int32_t)lround(p.lat * 1000000.0);
+      _prefs.fixed_lon_e6 = (int32_t)lround(p.lon * 1000000.0);
+      _prefs.fixed_alt_m = (int16_t)p.alt;
+      _prefs.has_fixed_pos = 1;
+      savePrefs();
+      Serial.printf("   OK, configured position = GPS fix %.6f, %.6f alt %dm\n", p.lat, p.lon, p.alt);
     } else if (strcmp(config, "pos clear") == 0) {
       _prefs.has_fixed_pos = 0;
       _prefs.fixed_lat_e6 = _prefs.fixed_lon_e6 = 0;
@@ -1623,6 +1815,8 @@ public:
       handleTarget(&cmd[6]);
     } else if (strcmp(cmd, "send") == 0) {
       sendNow();
+    } else if (strcmp(cmd, "nbr") == 0) {
+      printNeighbours();
     } else if (strcmp(cmd, "advert") == 0) {
       sendAdvert(false);
     } else if (strcmp(cmd, "advert flood") == 0) {
@@ -1755,6 +1949,7 @@ static void renderSenderMain(DisplayDriver& d) {
            the_mesh.isRepeating() ? " R" : "");
   drawLine(d, 0, buf);
   if (p.src == POS_GPS)          snprintf(buf, sizeof(buf), "GPS fix %dsat", p.sats);
+  else if (p.src == POS_LAST)    snprintf(buf, sizeof(buf), "GPS lost: last fix");
   else if (the_mesh.hasGps())    snprintf(buf, sizeof(buf), "GPS no fix (%dsat)%s", p.sats, p.src == POS_MANUAL ? " M" : "");
   else if (p.src == POS_MANUAL)  snprintf(buf, sizeof(buf), "fixed position");
   else                           snprintf(buf, sizeof(buf), "NO POSITION");
@@ -1797,7 +1992,8 @@ static void renderReceiverMain(DisplayDriver& d) {
   if (!the_mesh.wifiConfigured()) snprintf(buf, sizeof(buf), "WiFi: not set");
   else snprintf(buf, sizeof(buf), "WiFi %s", the_mesh.getWifiStatus());
   drawLine(d, 1, buf);
-  snprintf(buf, sizeof(buf), "Bayou %s q%d", the_mesh.getPostStatus(), the_mesh.getQueueLen());
+  snprintf(buf, sizeof(buf), "Bayou %s q%d nb%d", the_mesh.getPostStatus(), the_mesh.getQueueLen(),
+           the_mesh.getNbrCount());
   drawLine(d, 2, buf);
 #else
   drawLine(d, 1, "(no WiFi on board)");

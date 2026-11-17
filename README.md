@@ -69,11 +69,16 @@ Radio settings are the US public MeshCore preset (910.525 MHz, BW 62.5, SF7, CR5
 so existing community repeaters can carry the traffic. A new node generates its
 identity on first boot.
 
-**Heltec V4 flashing quirks:**
-- **After flashing, tap RST.** With esptool 4.5 the board stays in the bootloader
-  after an upload over its built-in USB.
-- **If the upload fails** with `OSError: [Errno 71] Protocol error`, hold PRG, tap
-  RST, release PRG, then upload again. A different cable or port also helps.
+**Heltec V4 flashing:** esptool's automatic reset over the V4's built-in USB is
+unreliable with this firmware (`OSError: [Errno 71] Protocol error`). Use the buttons
+instead:
+1. Hold **PRG**, tap **RST**, release **PRG**. The board is now in its bootloader.
+2. Run the upload.
+3. Tap **RST** to start the new firmware.
+
+The Heltec V3 has a separate USB-serial chip, so it flashes and restarts by itself.
+Its boot log shows a burst of harmless `i2cRead returned Error -1` lines while it
+probes for optional sensors.
 
 Settings, contacts and targets live in flash and survive reflashing.
 
@@ -155,6 +160,17 @@ While there is no path, every attempt is a flood across the public mesh.
 
 ## Later: finding spots for your own repeaters
 
+**Pairing a new Rover with houses that are already deployed.** The Rover needs
+the houses' cards. Import `cards/Waltham.txt` and `cards/Lincoln.txt` on its console,
+then `target add` each house.
+
+Each house also needs the Rover's key, or it can't decrypt the Rover's pings. Give it
+the key in one of these ways:
+- **Over USB:** run `import` with the Rover's `card` on the house's console.
+- **Over the air:** stand near the house and long-press **Send advert** on the Rover's
+  OLED (page 4). The house adds the Rover automatically, and favourites it on the
+  first ping.
+
 Carry the Rover around. Every 30 s it sends a zero-hop ping to each house and logs
 the result with its GPS position. The OLED shows each house as `OK -3dB 12s` or
 `NO ACK`. A spot where **both** houses answer is a candidate relay site. The
@@ -197,6 +213,7 @@ python3 examples/range_sim.py                     # prints a /range/ URL
 | `list {n}`, `favourite <name>`, `unfavourite <name>`, `purge` | contacts |
 | `target`, `target add <name>`, `target remove <name>`, `target clear` | up to 4 targets |
 | `send` | run one send cycle now (also: long press on the OLED's main page) |
+| `nbr` | repeaters this node hears **directly** (from all flood traffic), with packet count, SNR and RSSI. Use it to find a good spot for a household node |
 | `advert` / `advert flood` | zero-hop / flood advert (a flood advert also goes out at boot and every 12 h) |
 | `log`, `log dump`, `log clear` | flash log size / print / erase |
 | `set role sender\|receiver` | apply the role defaults in the table above |
@@ -221,6 +238,7 @@ standard feed pages can chart them.
 | `ping` | the sending node (`res=ok` / `to`) and the receiving node (`res=rx`) | `src sid sk dst did dk seq m res fix hops path snr_f rssi_f snr_r rssi_r rtt b` | `node_id`=sid, `gps_*`=sender position, `aux_1`=snr_f, `rssi`=rssi_f, `aux_2`=snr_r, `aux_3`=hops, `battery_volts` |
 | `adv` | households, for repeaters/rooms they hear | `rep rid rk name key type hops path snr rssi` | `node_id`=rid, `gps_*`=repeater position if advertised, `aux_1`, `rssi`, `aux_3` |
 | `status` | households, hourly | `name id key role fix up_s nc wifi fw b` | `node_id`, `gps_*`, `battery_volts` |
+| `nbr` | households, hourly with `status` | `rep rid rk hash n snr snr_min snr_max rssi span`: one row per node heard **directly**, aggregated over `span` seconds from all flood traffic (no message contents) | `node_id`=rid, `aux_1`=snr, `rssi`, `aux_2`=n |
 
 - `t` is unix time from the node's clock: GPS on the sender, NTP on the households.
   `0` means the clock isn't set yet.
