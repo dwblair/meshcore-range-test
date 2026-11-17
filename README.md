@@ -253,6 +253,8 @@ python3 examples/range_sim.py                     # prints a /range/ URL
 | `set repeat on\|off` | forward other nodes' packets |
 | `set log on\|off`, `set display on\|auto` | flash logging; OLED always on or auto-off |
 | `set lat`, `set lon`, `set alt`, `set pos clear` | fixed position (used whenever there's no GPS fix) |
+| `set radio <MHz>,<kHz>,<sf>,<cr>` | radio settings, applied immediately and saved (e.g. `set radio 910.525,62.5,7,5`). **Every node you want to reach must match**; nodes on different settings can't hear each other |
+| `set radio default`, `radio` | back to the built-in US preset (910.525 / 62.5 / SF7 / CR5); show the current settings |
 | `set wifi_ssid`, `set wifi_password` | Wi-Fi (reboot to apply) |
 | `set bayou_public_key`, `set bayou_private_key`, `set status_interval <s>` | Bayou |
 | `reboot`, `ver`, `help` | |
@@ -267,7 +269,7 @@ standard feed pages can chart them.
 |---|---|---|---|
 | `ping` | the sending node (`res=ok` / `to`) and the receiving node (`res=rx`) | `src sid sk dst did dk seq m res fix hops path snr_f rssi_f snr_r rssi_r rtt b` | `node_id`=sid, `gps_*`=sender position, `aux_1`=snr_f, `rssi`=rssi_f, `aux_2`=snr_r, `aux_3`=hops, `battery_volts` |
 | `adv` | households, for repeaters/rooms they hear | `rep rid rk name key type hops path snr rssi` | `node_id`=rid, `gps_*`=repeater position if advertised, `aux_1`, `rssi`, `aux_3` |
-| `status` | households, hourly | `name id key role fix up_s nc wifi fw b` | `node_id`, `gps_*`, `battery_volts` |
+| `status` | households, hourly (and any node with Wi-Fi) | `name id key role fix up_s nc wifi rf fw b` (`rf` = radio settings, e.g. `910.525,62.5,7,5`) | `node_id`, `gps_*`, `battery_volts` |
 | `nbr` | households hourly (with `status`); the sender at the start of every round, with `fix` + its position | `rep rid rk hash n snr snr_min snr_max rssi span [fix lat lon alt]`: one row per node heard **directly**, aggregated over `span` seconds from all flood traffic (no message contents) | `node_id`=rid, `aux_1`=snr, `rssi`, `aux_2`=n, `gps_*` (sender) |
 
 - `t` is unix time from the node's clock: GPS on the sender, NTP on the households.

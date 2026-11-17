@@ -261,7 +261,36 @@ struct RangePrefs {   // persisted to /range_prefs
   char wifi_password[64];
   char bayou_public_key[32];
   char bayou_private_key[32];
+  // --- appended later: radio settings. Older /range_prefs files end before this point;
+  // loadPrefs accepts them and fills these from the build-time defaults. Only ever append.
+  uint32_t radio_magic;          // RADIO_MAGIC when the fields below are set
+  float radio_freq;              // MHz
+  float radio_bw;                // kHz
+  uint8_t radio_sf;
+  uint8_t radio_cr;
+  uint8_t reserved2[2];
 };
+
+#define RADIO_MAGIC  0x31444152UL   // "RAD1"
+
+// LoRa bandwidths the SX126x supports (kHz)
+static bool validLoraBw(float bw) {
+  static const float v[] = { 7.8f, 10.4f, 15.6f, 20.8f, 31.25f, 41.7f, 62.5f, 125.0f, 250.0f, 500.0f };
+  for (unsigned i = 0; i < sizeof(v)/sizeof(v[0]); i++) if (fabsf(bw - v[i]) < 0.05f) return true;
+  return false;
+}
+
+static bool radioParamsValid(float freq, float bw, int sf, int cr) {
+  return freq >= 137.0f && freq <= 1020.0f && validLoraBw(bw) && sf >= 5 && sf <= 12 && cr >= 5 && cr <= 8;
+}
+
+// "62.5" / "250" / "7.8": bandwidth without trailing zeros
+static void fmtBw(char* dst, size_t sz, float bw) {
+  snprintf(dst, sz, "%.2f", bw);
+  char* e = dst + strlen(dst) - 1;
+  while (e > dst && *e == '0') *e-- = 0;
+  if (*e == '.') *e = 0;
+}
 
 // A round sends one or two legs to every target: a zero-hop ping ("can this spot reach the
 // house directly?") and/or a routed one ("which repeaters carry me from here?").
@@ -492,6 +521,15 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     _prefs.node_id = 1;
     _prefs.status_interval_secs = STATUS_DEFAULT_INTERVAL;
     applyRoleDefaults(ROLE_RECEIVER);
+    setRadioDefaults();
+  }
+
+  void setRadioDefaults() {   // the build-time preset (US: 910.525 / 62.5 / SF7 / CR5)
+    _prefs.radio_magic = RADIO_MAGIC;
+    _prefs.radio_freq = LORA_FREQ;
+    _prefs.radio_bw = LORA_BW;
+    _prefs.radio_sf = LORA_SF;
+    _prefs.radio_cr = LORA_CR;
   }
 
   void loadPrefs() {
@@ -500,13 +538,19 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     File file = openRead("/range_prefs");
     if (!file) return;
     RangePrefs p;
-    if (file.read((uint8_t*)&p, sizeof(p)) == sizeof(p) && p.magic == PREFS_MAGIC) {
+    memcpy(&p, &_prefs, sizeof(p));             // defaults for fields an older (shorter) file lacks
+    int n = file.read((uint8_t*)&p, sizeof(p));
+    if (n >= (int)offsetof(RangePrefs, radio_magic) && p.magic == PREFS_MAGIC) {
       memcpy(&_prefs, &p, sizeof(_prefs));
       _prefs.node_name[sizeof(_prefs.node_name)-1] = 0;
       _prefs.wifi_ssid[sizeof(_prefs.wifi_ssid)-1] = 0;
       _prefs.wifi_password[sizeof(_prefs.wifi_password)-1] = 0;
       _prefs.bayou_public_key[sizeof(_prefs.bayou_public_key)-1] = 0;
       _prefs.bayou_private_key[sizeof(_prefs.bayou_private_key)-1] = 0;
+      if (_prefs.radio_magic != RADIO_MAGIC ||
+          !radioParamsValid(_prefs.radio_freq, _prefs.radio_bw, _prefs.radio_sf, _prefs.radio_cr)) {
+        setRadioDefaults();
+      }
     }
     file.close();
   }
@@ -1002,6 +1046,9 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   #if HAS_WIFI
     if (WiFi.status() == WL_CONNECTED) L.add(" wifi=%d", (int)WiFi.RSSI());
   #endif
+    char bw[10];
+    fmtBw(bw, sizeof(bw), _prefs.radio_bw);
+    L.add(" rf=%.3f,%s,%u,%u", _prefs.radio_freq, bw, (unsigned)_prefs.radio_sf, (unsigned)_prefs.radio_cr);
     L.add(" fw=%s b=%.2f", FW_TAG, battVolts());
     addPosition(L, p);
     recordEvent(L.s);
@@ -1606,6 +1653,20 @@ public:
     next_flood_advert_at = millis() + ADVERT_FLOOD_INTERVAL_MS;
   }
 
+  // Radio settings come from prefs (set radio ...), defaulting to the build-time preset.
+  void applyRadio() {
+    radio_set_params(_prefs.radio_freq, _prefs.radio_bw, _prefs.radio_sf, _prefs.radio_cr);
+  }
+
+  void printRadio(const char* prefix) {
+    char bw[10];
+    fmtBw(bw, sizeof(bw), _prefs.radio_bw);
+    bool dflt = fabsf(_prefs.radio_freq - (float)LORA_FREQ) < 0.0005f && fabsf(_prefs.radio_bw - (float)LORA_BW) < 0.05f &&
+                _prefs.radio_sf == LORA_SF && _prefs.radio_cr == LORA_CR;
+    Serial.printf("%s%.3f MHz, BW %s kHz, SF%u, CR%u%s\n", prefix, _prefs.radio_freq, bw,
+                  (unsigned)_prefs.radio_sf, (unsigned)_prefs.radio_cr, dflt ? " (built-in default)" : "");
+  }
+
   void beginNetwork() {
   #if HAS_WIFI
     beginWifi();
@@ -1620,7 +1681,7 @@ public:
     Serial.printf("Node: %s (id %u)  role: %s  mode: %s\n", _prefs.node_name, (unsigned)_prefs.node_id,
                   roleName(_prefs.role), modeName(_prefs.mode));
     Serial.print("Public key: "); mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE); Serial.println();
-    Serial.printf("Radio: %.3f MHz BW %.1f SF%d CR%d\n", (double)LORA_FREQ, (double)LORA_BW, LORA_SF, LORA_CR);
+    printRadio("Radio: ");
     printCard();
     Serial.println("(enter 'help' for commands)");
     Serial.println();
@@ -1652,6 +1713,7 @@ public:
   void printStatus() {
     Position p = getPosition();
     Serial.printf("   board: %s\n", board.getManufacturerName());
+    printRadio("   radio: ");
     Serial.printf("   node: %s (id %u, key %s)  role=%s mode=%s repeat=%s\n", _prefs.node_name,
                   (unsigned)_prefs.node_id, self_key, roleName(_prefs.role), modeName(_prefs.mode), _prefs.repeat ? "on" : "off");
     Serial.printf("   position: %s", fixName(p.src));
@@ -1718,6 +1780,9 @@ public:
     Serial.println("   set display on|auto          - keep OLED on, or auto-off after 60 s");
     Serial.println("   set lat <deg> / set lon <deg> / set alt <m>  - fixed position (used without GPS fix)");
     Serial.println("   set pos gps                  - store the current GPS fix as the fixed position");
+    Serial.println("   set radio <MHz>,<kHz>,<sf>,<cr>  - radio settings, e.g. 910.525,62.5,7,5 (applied now)");
+    Serial.println("   set radio default            - back to the built-in preset");
+    Serial.println("   radio                        - show the radio settings");
     Serial.println("   set pos clear                - forget the fixed position");
   #if HAS_WIFI
     Serial.println("   set wifi_ssid <ssid> / set wifi_password <pwd>  (reboot to apply)");
@@ -1728,7 +1793,41 @@ public:
   }
 
   void handleSet(const char* config) {
-    if (memcmp(config, "role ", 5) == 0) {
+    if (memcmp(config, "radio ", 6) == 0) {
+      const char* a = &config[6];
+      float f, bw;
+      int sf, cr;
+      if (strcmp(a, "default") == 0) {
+        f = LORA_FREQ; bw = LORA_BW; sf = LORA_SF; cr = LORA_CR;
+      } else {   // "<MHz>,<kHz>,<sf>,<cr>" (same as the stock repeater's `set radio`)
+        char tmp[48];
+        StrHelper::strncpy(tmp, a, sizeof(tmp));
+        char* parts[4];
+        int np = 0;
+        char* s = tmp;
+        while (np < 4) {
+          parts[np++] = s;
+          char* c = strchr(s, ',');
+          if (!c) break;
+          *c = 0;
+          s = c + 1;
+        }
+        if (np != 4) { Serial.println("   usage: set radio <MHz>,<kHz>,<sf>,<cr>   e.g. set radio 910.525,62.5,7,5"); return; }
+        f = atof(parts[0]); bw = atof(parts[1]); sf = atoi(parts[2]); cr = atoi(parts[3]);
+      }
+      if (!radioParamsValid(f, bw, sf, cr)) {
+        Serial.println("   ERROR: invalid. Bandwidth one of 7.8 10.4 15.6 20.8 31.25 41.7 62.5 125 250 500 kHz, SF 5-12, CR 5-8");
+        return;
+      }
+      _prefs.radio_freq = f; _prefs.radio_bw = bw; _prefs.radio_sf = sf; _prefs.radio_cr = cr;
+      _prefs.radio_magic = RADIO_MAGIC;
+      savePrefs();
+      applyRadio();
+      printRadio("   OK, radio now: ");
+      if (f < 902.0f || f > 928.0f) Serial.println("   WARNING: outside the US 902-928 MHz band");
+      Serial.println("   Every node you want to reach must use the same settings: nodes on different");
+      Serial.println("   frequency / bandwidth / SF can't hear each other at all.");
+    } else if (memcmp(config, "role ", 5) == 0) {
       const char* r = &config[5];
       if (strcmp(r, "sender") == 0) applyRoleDefaults(ROLE_SENDER);
       else if (strcmp(r, "receiver") == 0) applyRoleDefaults(ROLE_RECEIVER);
@@ -1891,6 +1990,8 @@ public:
       handleTarget(&cmd[6]);
     } else if (strcmp(cmd, "send") == 0) {
       sendNow();
+    } else if (strcmp(cmd, "radio") == 0) {
+      printRadio("   radio: ");
     } else if (strcmp(cmd, "nbr") == 0) {
       printNeighbours();
     } else if (strcmp(cmd, "advert") == 0) {
@@ -2224,7 +2325,7 @@ void setup() {
   #error "need to define filesystem"
 #endif
 
-  radio_set_params(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
+  the_mesh.applyRadio();   // saved radio settings (set radio ...), default = build preset
   radio_set_tx_power(LORA_TX_POWER);
 
   sensors.begin();
