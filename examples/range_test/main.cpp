@@ -633,6 +633,17 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
 
   float battVolts() { return board.getBattMilliVolts() / 1000.0f; }
 
+  // For the display: reading the battery ADC blocks ~10 ms, so refresh it every 10 s only.
+  float batt_cache = 0;
+  unsigned long batt_cache_at = 0;
+  float cachedBattVolts() {
+    if (batt_cache_at == 0 || millis() - batt_cache_at > 10000UL) {
+      batt_cache = battVolts();
+      batt_cache_at = millis();
+    }
+    return batt_cache;
+  }
+
   uint32_t nextSeq() {
     seq++;
     if (seq >= _prefs.seq_base + SEQ_BLOCK) { _prefs.seq_base = seq; savePrefs(); }
@@ -1516,6 +1527,7 @@ public:
     return d > 0 ? d / 1000 : 0;
   }
   bool isBusy() const { return ss_state != SS_IDLE; }
+  float getBattVolts() { return cachedBattVolts(); }
 #if HAS_WIFI
   const char* getWifiStatus() const { return wifi_status; }
   const char* getPostStatus() const { return post_status; }
@@ -2026,9 +2038,12 @@ static void legText(char* out, size_t sz, const LegStat& ls, bool routed) {
 static void renderSenderMain(DisplayDriver& d) {
   char buf[40], nm[12], age[8];
   Position p = the_mesh.currentPosition();
-  snprintf(buf, sizeof(buf), "%.10s #%lu%s", the_mesh.getNodeName(), (unsigned long)the_mesh.getSeq(),
+  snprintf(buf, sizeof(buf), "%.8s #%lu%s", the_mesh.getNodeName(), (unsigned long)the_mesh.getSeq(),
            the_mesh.isRepeating() ? " R" : "");
   drawLine(d, 0, buf);
+  char bv[10];
+  snprintf(bv, sizeof(bv), "%.2fV", the_mesh.getBattVolts());   // battery, right-aligned on the top line
+  d.drawTextRightAlign(d.width() - 1, 10, bv);
   if (p.src == POS_GPS)          snprintf(buf, sizeof(buf), "GPS fix %dsat", p.sats);
   else if (p.src == POS_LAST)    snprintf(buf, sizeof(buf), "GPS lost: last fix");
   else if (the_mesh.hasGps())    snprintf(buf, sizeof(buf), "GPS no fix (%dsat)%s", p.sats, p.src == POS_MANUAL ? " M" : "");

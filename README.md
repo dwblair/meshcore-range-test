@@ -25,9 +25,9 @@ with one added example, `examples/range_test`. Upstream MeshCore's README is in
                           later: tools/range_log_upload.py
                                        │
                          ┌─────────────┴──────────┐
-                         │ sender (Heltec V4+GPS) │ zero-hop pings to each house
-                         │ roams, logs to flash   │ every 30 s, logs position +
-                         └────────────────────────┘ result of every attempt
+                         │ sender (Heltec V4+GPS) │ every 5 min (or button): a direct
+                         │ roams, logs to flash   │ and a routed ping to each house,
+                         └────────────────────────┘ + repeaters heard, with position
 ```
 
 ## One firmware, two roles
@@ -37,20 +37,27 @@ Every node runs `examples/range_test`; `set role` picks the behaviour.
 | | **receiver** (one per household) | **sender** (roaming, GPS) |
 |---|---|---|
 | Hardware | Heltec V4 or V3 (Wi-Fi) | Heltec V4 + GPS module |
-| Sends to its targets | every 10 min, **routed** (flood → learned path) | every 30 s, **direct** (zero-hop only) |
-| Results go to | Bayou, live over Wi-Fi | flash log → upload later |
-| Also posts | `rx` rows for everything it receives; hourly status; public repeaters it hears | — |
+| Sends to its targets | every 10 min, **routed** (flood → learned path) | every 5 min or on a long press of PRG: **both**, a direct ping and then a routed (flooded) ping to each house |
+| Results go to | Bayou, live over Wi-Fi | flash log → upload later (live too while it has Wi-Fi) |
+| Also posts | `rx` rows for everything it receives; hourly status; repeaters it hears (adverts + direct neighbours) | each round: the repeaters it heard directly, tagged with its GPS position |
 | Repeats others' packets | on | off (toggle on from the OLED when parked) |
-| OLED | Wi-Fi/Bayou status, last message received | GPS, per-target OK / NO ACK + SNR, next send |
+| OLED | Wi-Fi/Bayou status, last message received | battery, GPS, one line per house with both results, next round |
 
 **routed** = a normal MeshCore DM. With no known path it floods (any public repeater
 can carry it); the receiving house returns the path with its ACK, and later attempts
 go direct along that path. A missed ACK on a direct attempt clears the path so the
-next attempt floods again. Floods are limited to one per target per 5 minutes.
+next attempt floods again.
 
 **direct** = zero-hop: only a direct radio link between the two nodes counts, and
 nobody repeats it. The receiving house ACKs zero-hop too. This is the right test
 for "would a repeater *here* hear both houses?", and it puts no load on the public mesh.
+
+**both** (the sender default) = each round sends the direct ping to every house, then a
+routed ping that **always floods**. That's route discovery: the receiving house records
+which repeaters carried it *from where the Rover is now*, rather than replaying a route
+learned somewhere else. Each kind of ping has its own `seq`, so the map never merges
+them. Floods are limited to one per house per minute, so pressing the button again
+right away skips the routed ping (`w` on the screen).
 
 A Rook (`Rook_range_test`) can run the same firmware as a fixed relay or pinger
 without Wi-Fi (its messages show up on Bayou via the houses that receive them), or
@@ -171,11 +178,34 @@ the key in one of these ways:
   OLED (page 4). The house adds the Rover automatically, and favourites it on the
   first ping.
 
-Carry the Rover around. Every 30 s it sends a zero-hop ping to each house and logs
-the result with its GPS position. The OLED shows each house as `OK -3dB 12s` or
-`NO ACK`. A spot where **both** houses answer is a candidate relay site. The
-households also post every Rover ping they hear, live, so you'll see those spots on
-the map even before uploading.
+Carry the Rover around (a USB power bank works). Every 5 minutes, or whenever you
+**long-press PRG** on its main screen, it runs a round: a direct ping, then a routed
+ping, to each house. It logs every result with its GPS position, plus the repeaters it
+heard directly since the last round. The households post every Rover ping they hear,
+live, so those spots appear on the map before you upload anything.
+
+The Rover's screen:
+
+```
+Rover #487        4.08V     name, round number, battery (≈4.2 V full, ≈3.4 V empty)
+GPS fix 9sat                no fix yet: rounds carry no position
+Waltha D+12 R2h 40s         one line per house, then time since its last result
+Lincol Dx  R3h 40s
+next 245s log 12K
+```
+
+| On a house's line | Meaning |
+|---|---|
+| `D+12` | **direct** ping ACKed, at +12 dB SNR |
+| `R2h` | **routed** ping ACKed, over 2 repeater hops (`R0h` = direct radio link) |
+| `x` | no ACK |
+| `..` | waiting for the ACK |
+| `w` | routed ping skipped (one flood per house per minute) |
+| `-` | not tried yet |
+
+So `Lincol Dx R3h` means "no direct link from here, but it got through via 3 repeaters".
+A spot where the **direct** ping reaches **both** houses is a candidate relay site.
+Short presses of PRG step through the screens: main → Send now → Repeat → Send advert.
 
 **Bridging test:** park the Rover at a promising spot and switch **Repeat: ON**
 (OLED page 3, long press). If the households start reaching each other, their path
@@ -219,7 +249,7 @@ python3 examples/range_sim.py                     # prints a /range/ URL
 | `set role sender\|receiver` | apply the role defaults in the table above |
 | `set name`, `set node_id` | identity on the map (`node_id` 1–65535) |
 | `set interval <s>` | send interval, `0` = only on `send` |
-| `set mode direct\|routed` | zero-hop only, or normal routed DM |
+| `set mode direct\|routed\|both` | zero-hop only / normal routed DM / both every round, with the routed ping always flooding (sender default) |
 | `set repeat on\|off` | forward other nodes' packets |
 | `set log on\|off`, `set display on\|auto` | flash logging; OLED always on or auto-off |
 | `set lat`, `set lon`, `set alt`, `set pos clear` | fixed position (used whenever there's no GPS fix) |
@@ -238,14 +268,14 @@ standard feed pages can chart them.
 | `ping` | the sending node (`res=ok` / `to`) and the receiving node (`res=rx`) | `src sid sk dst did dk seq m res fix hops path snr_f rssi_f snr_r rssi_r rtt b` | `node_id`=sid, `gps_*`=sender position, `aux_1`=snr_f, `rssi`=rssi_f, `aux_2`=snr_r, `aux_3`=hops, `battery_volts` |
 | `adv` | households, for repeaters/rooms they hear | `rep rid rk name key type hops path snr rssi` | `node_id`=rid, `gps_*`=repeater position if advertised, `aux_1`, `rssi`, `aux_3` |
 | `status` | households, hourly | `name id key role fix up_s nc wifi fw b` | `node_id`, `gps_*`, `battery_volts` |
-| `nbr` | households, hourly with `status` | `rep rid rk hash n snr snr_min snr_max rssi span`: one row per node heard **directly**, aggregated over `span` seconds from all flood traffic (no message contents) | `node_id`=rid, `aux_1`=snr, `rssi`, `aux_2`=n |
+| `nbr` | households hourly (with `status`); the sender at the start of every round, with `fix` + its position | `rep rid rk hash n snr snr_min snr_max rssi span [fix lat lon alt]`: one row per node heard **directly**, aggregated over `span` seconds from all flood traffic (no message contents) | `node_id`=rid, `aux_1`=snr, `rssi`, `aux_2`=n, `gps_*` (sender) |
 
 - `t` is unix time from the node's clock: GPS on the sender, NTP on the households.
   `0` means the clock isn't set yet.
 - `m` is the route: `zh` zero-hop, `fl` flood, `dr` direct along a known path.
 - `path` lists repeater hashes from sender to receiver (`a3.7f`). A hash is the first
   byte of a repeater's key, so the map resolves it against `adv` rows.
-- `seq` never repeats for a given sender, even across reboots, so (`sk`, `seq`, `dk`)
+- `seq` never repeats for a given sender, even across reboots (each leg of a sender round gets its own), so (`sk`, `seq`, `dk`)
   identifies one attempt.
 - Rows uploaded from a flash log carry `up=1`.
 - People's (chat) nodes are never posted. Only repeaters and room servers are.
