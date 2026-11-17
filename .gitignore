@@ -16,3 +16,6 @@ cmake-*
 compile_commands.json
 .venv/
 venv/
+
+# range_test: saved flash-log dumps (contain GPS tracks)
+rangelog_*.txt
