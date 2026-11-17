@@ -93,11 +93,12 @@
 
 #define MAX_TARGETS               4
 #define TARGET_PREFIX_LEN         6
-#define SENDER_DEFAULT_INTERVAL   30           // seconds (roaming sender, direct mode)
+#define SENDER_DEFAULT_INTERVAL   300          // seconds (roaming sender: a direct + a routed ping per round)
+#define MAX_ROUND_NBR_ROWS        8            // sender: neighbours logged per round
 #define RECEIVER_DEFAULT_INTERVAL 600          // seconds (household -> household, routed; only if targets set)
 #define FLOOD_ACK_TIMEOUT_MIN_MS  30000UL      // multi-hop public routes are slow: be generous
 #define DIRECT_ACK_TIMEOUT_MIN_MS 15000UL
-#define ROUTED_MIN_FLOOD_GAP_MS   (5UL*60UL*1000UL)  // at most one flood per target per 5 min
+#define ROUTED_MIN_FLOOD_GAP_MS   (60UL*1000UL)      // at most one flood per target per minute (button presses)
 #define STATUS_DEFAULT_INTERVAL   3600         // seconds
 #define ADVERT_FLOOD_INTERVAL_MS  (12UL*3600UL*1000UL)
 #define ADV_POST_MIN_INTERVAL_MS  (6UL*3600UL*1000UL)
@@ -125,14 +126,14 @@
 /* ---------------------------------- HELPERS ------------------------------------------- */
 
 enum { ROLE_RECEIVER = 0, ROLE_SENDER = 1 };
-enum { MODE_DIRECT = 0, MODE_ROUTED = 1 };
+enum { MODE_DIRECT = 0, MODE_ROUTED = 1, MODE_BOTH = 2 };
 enum { POS_NONE = 0, POS_MANUAL = 1, POS_GPS = 2, POS_LAST = 3 };
 #define SENDER_LAST_FIX_MAX_MS  60000UL   // a moving sender may reuse its last fix only briefly
 enum { ROUTE_ZH = 0, ROUTE_FL = 1, ROUTE_DR = 2 };
 enum { RES_NONE = 0, RES_PENDING, RES_OK, RES_TIMEOUT, RES_FAIL, RES_NOCONTACT, RES_SKIPPED };
 
 static const char* roleName(uint8_t r)  { return r == ROLE_SENDER ? "sender" : "receiver"; }
-static const char* modeName(uint8_t m)  { return m == MODE_ROUTED ? "routed" : "direct"; }
+static const char* modeName(uint8_t m)  { return m == MODE_BOTH ? "both" : m == MODE_ROUTED ? "routed" : "direct"; }
 static const char* fixName(uint8_t s) {
   return s == POS_GPS ? "gps" : s == POS_LAST ? "last" : s == POS_MANUAL ? "man" : "none";
 }
@@ -164,14 +165,20 @@ static void sanitizeName(char* dst, size_t sz, const char* src) {
 
 // Path bytes -> "a3.7f" (each hop = hash_size bytes). enc_len uses the MeshCore encoding:
 // low 6 bits = hop count, top 2 bits = hash size - 1.
+// Paths are in transmit order, so the LAST hops are the ones nearest the node that received
+// the packet. If the path is longer than max_hops (or the buffer), keep those last hops: they
+// are what says something about local connectivity. The full count is reported separately.
 static void formatPath(char* dst, size_t sz, const uint8_t* path, uint8_t enc_len, uint8_t max_hops) {
   if (enc_len == OUT_PATH_UNKNOWN || (enc_len & 63) == 0) { StrHelper::strncpy(dst, "-", sz); return; }
   uint8_t count = enc_len & 63;
   uint8_t hsz = (enc_len >> 6) + 1;
+  uint8_t fit = (uint8_t)(sz / (hsz*2 + 1));   // each hop takes hsz*2 hex chars + '.' (or the NUL)
+  uint8_t n = count;
+  if (n > max_hops) n = max_hops;
+  if (n > fit) n = fit;
   size_t off = 0;
-  for (uint8_t h = 0; h < count && h < max_hops; h++) {
-    if (off + hsz*2 + 2 >= sz) break;
-    if (h) dst[off++] = '.';
+  for (uint8_t h = count - n; h < count; h++) {
+    if (off) dst[off++] = '.';
     toHexLower(&dst[off], &path[h*hsz], hsz);
     off += hsz*2;
   }
@@ -256,13 +263,22 @@ struct RangePrefs {   // persisted to /range_prefs
   char bayou_private_key[32];
 };
 
-struct TargetStat {
+// A round sends one or two legs to every target: a zero-hop ping ("can this spot reach the
+// house directly?") and/or a routed one ("which repeaters carry me from here?").
+enum { LEG_ZH = 0, LEG_RT = 1 };
+
+struct LegStat {
   uint8_t result;          // RES_*
   float ack_snr;
   int16_t ack_rssi;
   uint32_t rtt_ms;
+  int8_t hops;             // routed leg: hops of the route that worked (-1 unknown)
   unsigned long at_millis;
   uint32_t attempts, oks;
+};
+
+struct TargetStat {
+  LegStat leg[2];          // [LEG_ZH], [LEG_RT]
 };
 
 /* -------------------------------------------------------------------------------------- */
@@ -281,10 +297,14 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   TargetStat tstat[MAX_TARGETS];
   unsigned long last_flood_at[MAX_TARGETS];
 
-  // sender state machine: one target at a time, wait for its ACK, then the next
+  // sender state machine: for each leg of the round, one target at a time, wait for its
+  // ACK, then the next
   enum { SS_IDLE = 0, SS_NEXT, SS_WAIT_ACK };
   uint8_t ss_state;
   uint8_t ss_idx;
+  uint8_t cycle_legs[2];
+  uint8_t cycle_nlegs;
+  uint8_t ss_leg;
   uint32_t seq;
   uint32_t cycle_seq;
   uint32_t cycle_t;
@@ -449,7 +469,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   void applyRoleDefaults(uint8_t role) {
     _prefs.role = role;
     if (role == ROLE_SENDER) {
-      _prefs.mode = MODE_DIRECT;
+      _prefs.mode = MODE_BOTH;
       _prefs.send_interval_secs = SENDER_DEFAULT_INTERVAL;
       _prefs.repeat = 0;
       _prefs.log_enabled = 1;
@@ -926,15 +946,17 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   }
 
   // One k=nbr row per neighbour heard since the last summary (busiest first, capped), then
-  // start a new window.
-  void emitNeighbours() {
+  // start a new window. Households: hourly, no position (they're fixed). Sender: every round,
+  // tagged with the round's position (fix=...), so the map shows where each repeater is heard.
+  void emitNeighbours(bool at_round = false) {
     foldNeighbours();
     sortNeighboursByCount();
     if (nbr_count > 0) {
       char me[20];
       sanitizeName(me, sizeof(me), _prefs.node_name);
       unsigned long span = (millis() - nbr_window_start) / 1000;
-      for (uint8_t i = 0; i < nbr_count && i < MAX_NBR_ROWS; i++) {
+      uint8_t cap = at_round ? MAX_ROUND_NBR_ROWS : MAX_NBR_ROWS;
+      for (uint8_t i = 0; i < nbr_count && i < cap; i++) {
         const NbrStat& e = nbrs[i];
         char h[8];
         toHexLower(h, e.hash, e.hsz);
@@ -944,6 +966,10 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
               e.snr_sum / e.n, e.snr_min, e.snr_max);
         if (e.rssi_n) L.add(" rssi=%d", (int)lroundf(e.rssi_sum / e.rssi_n));
         L.add(" span=%lu", span);
+        if (at_round) {
+          L.add(" fix=%s", fixName(cycle_pos.src));
+          addPosition(L, cycle_pos);
+        }
         recordEvent(L.s);
       }
     }
@@ -982,7 +1008,8 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     // Neighbour summary rides along with the status row (skip a near-empty window at boot).
     // Status goes last: if the post queue ever overflows it drops the OLDEST rows, and the
     // status row is what puts this station on the map.
-    if (now - nbr_window_start >= 5UL * 60UL * 1000UL) emitNeighbours();
+    // (a sender summarises its neighbours every round instead, with position)
+    if (_prefs.role != ROLE_SENDER && now - nbr_window_start >= 5UL * 60UL * 1000UL) emitNeighbours();
     emitStatus();
     next_status_at = now + _prefs.status_interval_secs * 1000UL;
   }
@@ -1014,7 +1041,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     sanitizeName(me, sizeof(me), _prefs.node_name);
     sanitizeName(nm, sizeof(nm), c.name);
     keyHex(k, c.id.pub_key);
-    formatPath(pth, sizeof(pth), path, path_len, 8);
+    formatPath(pth, sizeof(pth), path, path_len, 12);
     Line L;
     L.add("k=adv v=1 t=%lu rep=%s rid=%u rk=%s name=%s key=%s type=%s hops=%d path=%s snr=%.2f",
           (unsigned long)nowUnix(), me, (unsigned)_prefs.node_id, self_key, nm, k,
@@ -1026,17 +1053,33 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
 
   /* ---------------- sender ---------------- */
 
+  uint8_t curLeg() const { return cycle_legs[ss_leg]; }
+
   void startCycle() {
-    cycle_seq = nextSeq();
     cycle_pos = getPosition();
     cycle_batt = battVolts();
     cycle_t = nowUnix();
+    // a roaming sender also logs which repeaters it heard directly since the last round,
+    // tagged with this round's position: where each repeater is audible
+    if (_prefs.role == ROLE_SENDER) emitNeighbours(true);
+    cycle_nlegs = 0;
+    if (_prefs.mode != MODE_ROUTED) cycle_legs[cycle_nlegs++] = LEG_ZH;
+    if (_prefs.mode != MODE_DIRECT) cycle_legs[cycle_nlegs++] = LEG_RT;
+    ss_leg = 0;
+    startLeg();
+  }
+
+  // Each leg gets its own seq: (sender key, seq, target) identifies one attempt, and the
+  // map must never merge a zero-hop ping with a routed one.
+  void startLeg() {
+    cycle_seq = nextSeq();
     ss_idx = 0;
     ss_state = SS_NEXT;
     ss_next_at = millis();
-    Serial.printf("[CYCLE %lu] pos=%s", (unsigned long)cycle_seq, fixName(cycle_pos.src));
+    Serial.printf("[ROUND %lu %s] pos=%s", (unsigned long)cycle_seq, curLeg() == LEG_ZH ? "direct" : "routed",
+                  fixName(cycle_pos.src));
     if (cycle_pos.src) Serial.printf(" %.6f,%.6f", cycle_pos.lat, cycle_pos.lon);
-    Serial.printf(" targets=%d mode=%s\n", target_count, modeName(_prefs.mode));
+    Serial.printf(" targets=%d\n", target_count);
   }
 
   void advanceTarget(unsigned long gap_ms) {
@@ -1048,7 +1091,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
 
   void sendToTarget(uint8_t i) {
     unsigned long now = millis();
-    TargetStat& ts = tstat[i];
+    LegStat& ts = tstat[i].leg[curLeg()];
     ContactInfo* c = lookupContactByPubKey(target_prefixes[i], TARGET_PREFIX_LEN);
     if (!c) {
       Serial.print("   skip: no contact for target ");
@@ -1061,10 +1104,14 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     sanitizeName(ss_dst_name, sizeof(ss_dst_name), c->name);
     keyHex(ss_dst_key, c->id.pub_key);
 
-    bool direct_mode = (_prefs.mode == MODE_DIRECT);
+    bool direct_mode = (curLeg() == LEG_ZH);
+    // In "both" mode the routed leg is route DISCOVERY: always flood, so the receiving house
+    // records which repeaters carry us from this spot (a learned path would just replay the
+    // route found somewhere else).
+    if (!direct_mode && _prefs.mode == MODE_BOTH) c->out_path_len = OUT_PATH_UNKNOWN;
     if (!direct_mode && c->out_path_len == OUT_PATH_UNKNOWN &&
         last_flood_at[i] != 0 && (now - last_flood_at[i]) < ROUTED_MIN_FLOOD_GAP_MS) {
-      Serial.printf("   -> %s: skip (no path; last flood <5 min ago)\n", c->name);
+      Serial.printf("   -> %s: skip routed (last flood to it <1 min ago)\n", c->name);
       ts.result = RES_SKIPPED; ts.at_millis = now;
       advanceTarget(0);
       return;
@@ -1125,7 +1172,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     Serial.printf("   -> %s: sent (%s, path=%s, wait %lums)\n", c->name, routeName(ss_route), ss_fwd_path, (unsigned long)to);
   }
 
-  void emitSendEvent(const char* res, int hops, const char* path, bool with_ack, const TargetStat& ts) {
+  void emitSendEvent(const char* res, int hops, const char* path, bool with_ack, const LegStat& ts) {
     char me[20];
     sanitizeName(me, sizeof(me), _prefs.node_name);
     Line L;
@@ -1144,7 +1191,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
 
   void onTargetAck(ContactInfo* c) {
     unsigned long now = millis();
-    TargetStat& ts = tstat[ss_idx];
+    LegStat& ts = tstat[ss_idx].leg[curLeg()];
     ts.result = RES_OK;
     ts.oks++;
     ts.rtt_ms = now - ss_sent_at;
@@ -1161,18 +1208,20 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     } else if (ss_route == ROUTE_FL) {   // path just learned from the receiver's path-return
       if (c && c->out_path_len != OUT_PATH_UNKNOWN) {
         hops = c->out_path_len & 63;
-        formatPath(path, sizeof(path), c->out_path, c->out_path_len, 8);
+        formatPath(path, sizeof(path), c->out_path, c->out_path_len, 12);
       } else {
         hops = -1;
       }
     }
-    Serial.printf("   ACK from %s: rtt=%lums snr=%.2f rssi=%d\n", ss_dst_name, (unsigned long)ts.rtt_ms, ts.ack_snr, ts.ack_rssi);
+    ts.hops = (int8_t)hops;
+    Serial.printf("   ACK from %s: rtt=%lums snr=%.2f rssi=%d hops=%d path=%s\n", ss_dst_name,
+                  (unsigned long)ts.rtt_ms, ts.ack_snr, ts.ack_rssi, hops, path);
     emitSendEvent("ok", hops, path, true, ts);
     advanceTarget(400);
   }
 
   void onTargetTimeout() {
-    TargetStat& ts = tstat[ss_idx];
+    LegStat& ts = tstat[ss_idx].leg[curLeg()];
     ts.result = RES_TIMEOUT;
     ts.at_millis = millis();
     int hops = (ss_route == ROUTE_ZH) ? 0 : (ss_route == ROUTE_DR ? ss_fwd_hops : -1);
@@ -1202,7 +1251,10 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
         break;
       case SS_NEXT:
         if ((long)(now - ss_next_at) < 0) break;
-        if (ss_idx >= target_count) { ss_state = SS_IDLE; break; }
+        if (ss_idx >= target_count) {                    // leg done
+          if (++ss_leg < cycle_nlegs) startLeg(); else ss_state = SS_IDLE;
+          break;
+        }
         sendToTarget(ss_idx);
         break;
     }
@@ -1238,7 +1290,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     } else if (pkt->isRouteFlood()) {
       mode = "fl";
       hops = pkt->getPathHashCount();
-      formatPath(path, sizeof(path), pkt->path, pkt->path_len, 8);
+      formatPath(path, sizeof(path), pkt->path, pkt->path_len, 12);
     } else {
       // direct arrival: repeaters strip the path as they go, so trust the sender's view
       mode = "dr";
@@ -1411,6 +1463,7 @@ public:
     memset(tstat, 0, sizeof(tstat));
     memset(last_flood_at, 0, sizeof(last_flood_at));
     ss_state = SS_IDLE; ss_idx = 0; seq = 0; cycle_seq = 0; cycle_t = 0;
+    cycle_legs[0] = LEG_ZH; cycle_legs[1] = LEG_RT; cycle_nlegs = 0; ss_leg = 0;
     memset(&cycle_pos, 0, sizeof(cycle_pos));
     cycle_batt = 0;
     next_cycle_at = ss_next_at = ss_deadline = ss_sent_at = 0;
@@ -1598,11 +1651,19 @@ public:
     for (uint8_t i = 0; i < target_count; i++) {
       char nm[32];
       getTargetName(i, nm, sizeof(nm));
-      const TargetStat& ts = tstat[i];
       static const char* rn[] = {"-", "pending", "ok", "no ack", "send fail", "no contact", "skipped"};
-      Serial.printf("   target %d: %s  last=%s  ok %lu/%lu", i + 1, nm, rn[ts.result], (unsigned long)ts.oks, (unsigned long)ts.attempts);
-      if (ts.result == RES_OK) Serial.printf("  ack snr=%.2f rssi=%d rtt=%lums", ts.ack_snr, ts.ack_rssi, (unsigned long)ts.rtt_ms);
-      Serial.println();
+      Serial.printf("   target %d: %s\n", i + 1, nm);
+      for (uint8_t k = 0; k < 2; k++) {
+        const LegStat& ts = tstat[i].leg[k];
+        if (ts.attempts == 0 && ts.result == RES_NONE) continue;
+        Serial.printf("      %s: last=%s  ok %lu/%lu", k == LEG_ZH ? "direct" : "routed", rn[ts.result],
+                      (unsigned long)ts.oks, (unsigned long)ts.attempts);
+        if (ts.result == RES_OK) {
+          Serial.printf("  ack snr=%.2f rssi=%d rtt=%lums", ts.ack_snr, ts.ack_rssi, (unsigned long)ts.rtt_ms);
+          if (k == LEG_RT) Serial.printf(" hops=%d", ts.hops);
+        }
+        Serial.println();
+      }
     }
     if (rx_count) {
       Serial.printf("   received: %lu  last from %s %lus ago  snr=%.2f rssi=%.0f hops=%d (%s)\n", (unsigned long)rx_count,
@@ -1637,7 +1698,9 @@ public:
     Serial.println("   set name <name>              - node name (reboot to re-advertise)");
     Serial.println("   set node_id <n>              - numeric id used on Bayou (1-65535)");
     Serial.println("   set interval <secs>          - send interval (0 = only on 'send'/button)");
-    Serial.println("   set mode direct|routed       - zero-hop only, or normal routed DM");
+    Serial.println("   set mode direct|routed|both  - zero-hop only / routed DM / both each round");
+    Serial.println("                                  (both: the routed leg always floods, to discover");
+    Serial.println("                                  which repeaters carry it from where you are)");
     Serial.println("   set repeat on|off            - forward other nodes' packets");
     Serial.println("   set log on|off               - log send/receive events to flash");
     Serial.println("   set display on|auto          - keep OLED on, or auto-off after 60 s");
@@ -1684,7 +1747,8 @@ public:
       const char* m = &config[5];
       if (strcmp(m, "direct") == 0) _prefs.mode = MODE_DIRECT;
       else if (strcmp(m, "routed") == 0) _prefs.mode = MODE_ROUTED;
-      else { Serial.println("   ERROR: mode must be direct or routed"); return; }
+      else if (strcmp(m, "both") == 0) _prefs.mode = MODE_BOTH;
+      else { Serial.println("   ERROR: mode must be direct, routed or both"); return; }
       savePrefs();
       Serial.printf("   OK, mode = %s\n", modeName(_prefs.mode));
     } else if (memcmp(config, "repeat ", 7) == 0) {
@@ -1942,6 +2006,23 @@ static void drawPageDots(DisplayDriver& d) {
   }
 }
 
+// Compact leg result for the OLED: direct "+12" (ACK SNR) / routed "2h" (hops); "x" no ACK,
+// ".." in flight, "w" waiting on the flood rate limit, "!" send failed, "?" no contact, "-" none.
+static void legText(char* out, size_t sz, const LegStat& ls, bool routed) {
+  switch (ls.result) {
+    case RES_OK:
+      if (routed) { if (ls.hops >= 0) snprintf(out, sz, "%dh", ls.hops); else snprintf(out, sz, "ok"); }
+      else snprintf(out, sz, "%+.0f", ls.ack_snr);
+      break;
+    case RES_PENDING:   snprintf(out, sz, ".."); break;
+    case RES_TIMEOUT:   snprintf(out, sz, "x"); break;
+    case RES_SKIPPED:   snprintf(out, sz, "w"); break;
+    case RES_FAIL:      snprintf(out, sz, "!"); break;
+    case RES_NOCONTACT: snprintf(out, sz, "?"); break;
+    default:            snprintf(out, sz, "-"); break;
+  }
+}
+
 static void renderSenderMain(DisplayDriver& d) {
   char buf[40], nm[12], age[8];
   Position p = the_mesh.currentPosition();
@@ -1960,21 +2041,18 @@ static void renderSenderMain(DisplayDriver& d) {
     drawLine(d, 2, "no targets:");
     drawLine(d, 3, "target add <name>");
   }
+  // one line per house: "Waltha D+12 R2h 40s" = direct ok at +12 dB, routed ok over 2 hops
   for (int i = 0; i < n && i < 3; i++) {
     const TargetStat& ts = the_mesh.getTargetStat(i);
-    char tn[32];
+    char tn[32], dz[8], rt[8];
     the_mesh.getTargetName(i, tn, sizeof(tn));
     snprintf(nm, sizeof(nm), "%.6s", tn);
-    fmtAge(age, sizeof(age), ts.at_millis);
-    switch (ts.result) {
-      case RES_OK:        snprintf(buf, sizeof(buf), "%-6s OK %+.0fdB %s", nm, ts.ack_snr, age); break;
-      case RES_PENDING:   snprintf(buf, sizeof(buf), "%-6s sending...", nm); break;
-      case RES_TIMEOUT:   snprintf(buf, sizeof(buf), "%-6s NO ACK %s", nm, age); break;
-      case RES_FAIL:      snprintf(buf, sizeof(buf), "%-6s send fail", nm); break;
-      case RES_NOCONTACT: snprintf(buf, sizeof(buf), "%-6s no contact", nm); break;
-      case RES_SKIPPED:   snprintf(buf, sizeof(buf), "%-6s flood wait", nm); break;
-      default:            snprintf(buf, sizeof(buf), "%-6s --", nm); break;
-    }
+    legText(dz, sizeof(dz), ts.leg[LEG_ZH], false);
+    legText(rt, sizeof(rt), ts.leg[LEG_RT], true);
+    unsigned long at = ts.leg[LEG_ZH].at_millis;
+    if ((long)(ts.leg[LEG_RT].at_millis - at) > 0) at = ts.leg[LEG_RT].at_millis;
+    if (at) fmtAge(age, sizeof(age), at); else age[0] = 0;
+    snprintf(buf, sizeof(buf), "%-6s D%-3s R%-3s %s", nm, dz, rt, age);
     drawLine(d, 2 + i, buf);
   }
   long nx = the_mesh.secsToNextCycle();
