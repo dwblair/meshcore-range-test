@@ -112,7 +112,19 @@
 #define MAX_NBRS                  32
 #define MSG_PREFIX                "[RANGE]"
 
+// Chat tests: a DM from a person (e.g. the MeshCore phone app) rather than a range_test node.
+#define CHAT_SETTLE_MS            2500UL   // let our ACK go out before replying
+#define CHAT_PATH_WAIT_MS         8000UL   // after a flooded reply, wait this long to learn a path
+#define CHAT_TELEM_FLOOD_MS       25000UL  // wait for the sender's position (flooded request)
+#define CHAT_TELEM_DIRECT_MS      12000UL  // ... (direct request)
+#define CHAT_MIN_GAP_MS           10000UL  // at most one answered test per sender per 10 s
+#define CHAT_REPLY_MARK           " got #" // our replies contain this; never answer one
+#define CHAT_REQ_TELEMETRY        0x03     // MeshCore REQ_TYPE_GET_TELEMETRY_DATA
+#define CHAT_PERM_BASE            0x01     // = TELEM_PERM_BASE (battery)
+#define CHAT_PERM_LOCATION        0x02     // = TELEM_PERM_LOCATION
+
 #include <helpers/BaseChatMesh.h>
+#include <helpers/sensors/LPPDataHelpers.h>
 
 #define SEND_TIMEOUT_BASE_MILLIS          500
 #define FLOOD_SEND_TIMEOUT_FACTOR         16.0f
@@ -211,6 +223,44 @@ static bool isNumber(const char* s) {
     else return false;
   }
   return digit;
+}
+
+// A decimal like "42.4120" or "-71.29" (at least 2 decimal places) starting at s; returns its
+// length, 0 if none.
+static int decimalAt(const char* s, double& v) {
+  const char* p = s;
+  if (*p == '-') p++;
+  int ip = 0, fp = 0;
+  while (*p >= '0' && *p <= '9') { p++; ip++; }
+  if (ip == 0 || ip > 3 || *p != '.') return 0;
+  p++;
+  while (*p >= '0' && *p <= '9') { p++; fp++; }
+  if (fp < 2) return 0;
+  v = atof(s);
+  return p - s;
+}
+
+// Coordinates typed or pasted into a chat message: "lat=42.41 lon=-71.30", or a pair of
+// decimals separated only by spaces/commas/semicolons, as a maps app copies them
+// ("42.41208, -71.29789").
+static bool parseCoords(const char* text, double& lat, double& lon) {
+  char a[20], b[20];
+  if (kvGet(text, "lat", a, sizeof(a)) && kvGet(text, "lon", b, sizeof(b)) && isNumber(a) && isNumber(b)) {
+    lat = atof(a); lon = atof(b);
+  } else {
+    bool found = false;
+    for (const char* p = text; *p && !found; p++) {
+      if (p != text && ((p[-1] >= '0' && p[-1] <= '9') || p[-1] == '.' || p[-1] == '-')) continue;
+      int n = decimalAt(p, lat);
+      if (!n) continue;
+      const char* q = p + n;
+      while (*q == ' ' || *q == ',' || *q == ';') q++;
+      if (q == p + n) continue;
+      if (decimalAt(q, lon)) found = true;
+    }
+    if (!found) return false;
+  }
+  return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 && !(fabs(lat) < 0.01 && fabs(lon) < 0.01);
 }
 
 template <int N>
@@ -375,6 +425,29 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
   char rx_mode[4];
   unsigned long rx_at;
   uint32_t rx_count;
+
+  // Chat test in progress (receivers): a person messaged us. We answer in the chat with how
+  // we heard them, ask their node for its GPS position (MeshCore telemetry request), then
+  // log the test like a Rover ping. One at a time; a new one finishes the old one first.
+  enum { CT_IDLE = 0, CT_REPLY, CT_WAIT_PATH, CT_WAIT_POS };
+  struct ChatTest {
+    uint8_t stage;
+    uint8_t key[PUB_KEY_SIZE];
+    uint32_t seq, t, tag;
+    char src[20], mode[3], path[64];
+    int hops;
+    float snr, rssi;
+    bool has_pos;
+    char fix[5];
+    double lat, lon;
+    int alt;
+    float batt;                // their battery, from the position reply (0 = unknown)
+    char reply[MAX_TEXT_LEN];
+    unsigned long at;          // next step / deadline (millis)
+  } ct;
+  struct ChatGap { uint8_t key[4]; unsigned long at; };
+  ChatGap chat_gap[8];
+  uint8_t chat_gap_next;
 
   // last GPS fix since boot (RAM only, see getPosition)
   Position last_fix;
@@ -854,6 +927,7 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     // An HTTPS post blocks the loop for ~1 s. Don't do it while our ACK / reply may still be in
     // flight (just after a packet arrived) or while we are waiting for our own ACK.
     if (ss_state == SS_WAIT_ACK) return;
+    if (ct.stage != CT_IDLE) return;     // chat test: its reply / position request in flight
     if ((now - last_rx_millis) < 2500 && (now - q_head_since) < 30000) return;
 
     char json[JSON_MAX];
@@ -1389,6 +1463,182 @@ class RangeMesh : public BaseChatMesh, ContactVisitor {
     rx_count++;
   }
 
+  /* ---------------- chat tests: people messaging a house (e.g. the phone app) ---------------- */
+
+  // [RANGE] lines carrying a node id come from range_test nodes (Rover, the other house).
+  // Anything else is a person.
+  static bool fromRangeNode(const char* text) {
+    if (memcmp(text, MSG_PREFIX, strlen(MSG_PREFIX)) != 0) return false;
+    char sid[8];
+    return kvGet(text, "sid", sid, sizeof(sid)) && isNumber(sid) && atoi(sid) != 0;
+  }
+
+  // Name for a path hop in a chat reply: the one repeater/room whose key starts with that
+  // hash (printable ASCII, max 12 chars), else the hash in hex.
+  void hopName(char* dst, size_t sz, const uint8_t* hash, uint8_t hsz) {
+    ContactInfo c;
+    char name[32] = "";
+    int matches = 0;
+    for (int i = 0; i < getNumContacts() && matches < 2; i++) {
+      if (!getContactByIdx(i, c)) continue;
+      if (c.type != ADV_TYPE_REPEATER && c.type != ADV_TYPE_ROOM) continue;
+      if (memcmp(c.id.pub_key, hash, hsz) != 0) continue;
+      if (++matches == 1) StrHelper::strncpy(name, c.name, sizeof(name));
+    }
+    if (matches != 1) { toHexLower(dst, hash, hsz); return; }
+    size_t n = 0;
+    for (size_t i = 0; name[i] && n < sz - 1 && n < 12; i++) {
+      char ch = name[i];
+      if (ch >= 0x20 && ch < 0x7f) dst[n++] = ch;
+    }
+    while (n > 0 && dst[n-1] == ' ') n--;
+    dst[n] = 0;
+    if (n == 0) toHexLower(dst, hash, hsz);
+  }
+
+  // "2 hops via OwlHill>LEX-Fiske". Keeps the hops nearest us if the names don't fit.
+  void describeRoute(char* dst, size_t sz, const mesh::Packet* pkt) {
+    uint8_t count = pkt->path_len & 63, hsz = (pkt->path_len >> 6) + 1;
+    if (count == 0) { StrHelper::strncpy(dst, "straight to me, no repeaters", sz); return; }
+    char names[FLOOD_FORWARD_MAX_HOPS][14];
+    uint8_t n = count > FLOOD_FORWARD_MAX_HOPS ? FLOOD_FORWARD_MAX_HOPS : count;
+    uint8_t first = count - n;
+    for (uint8_t h = 0; h < n; h++) hopName(names[h], sizeof(names[h]), &pkt->path[(first + h) * hsz], hsz);
+    // how many of the last hops fit in ~80 chars
+    int total = 0, keep = 0;
+    for (int h = n - 1; h >= 0; h--) {
+      int w = strlen(names[h]) + 1;
+      if (total + w > 80) break;
+      total += w; keep++;
+    }
+    Line L;
+    L.add("%u hop%s via %s", (unsigned)count, count == 1 ? "" : "s", keep < count ? "..>" : "");
+    for (int h = n - keep; h < n; h++) L.add("%s%s", h > n - keep ? ">" : "", names[h]);
+    StrHelper::strncpy(dst, L.s, sz);
+  }
+
+  bool chatTooSoon(const uint8_t* key) {
+    unsigned long now = millis();
+    for (auto& g : chat_gap) {
+      if (g.at && memcmp(g.key, key, 4) == 0) {
+        if (now - g.at < CHAT_MIN_GAP_MS) return true;
+        g.at = now;
+        return false;
+      }
+    }
+    ChatGap& g = chat_gap[chat_gap_next++ % 8];
+    memcpy(g.key, key, 4);
+    g.at = now;
+    return false;
+  }
+
+  void handleChatTest(const ContactInfo& from, mesh::Packet* pkt, const char* text) {
+    if (strstr(text, CHAT_REPLY_MARK)) return;           // someone's automatic reply: never answer
+    if (chatTooSoon(from.id.pub_key)) { Serial.println("   (chat test ignored: <10 s after the last one)"); return; }
+    if (ct.stage != CT_IDLE) finishChatTest();            // log the previous one as it stands
+
+    ContactInfo* c = lookupContactByPubKey(from.id.pub_key, PUB_KEY_SIZE);
+    memset(&ct, 0, sizeof(ct));
+    memcpy(ct.key, from.id.pub_key, PUB_KEY_SIZE);
+    ct.seq = nextSeq();
+    ct.t = nowUnix();
+    sanitizeName(ct.src, sizeof(ct.src), from.name);
+    ct.snr = pkt->getSNR();
+    ct.rssi = last_rx_rssi;
+    char route[100];
+    if (pkt->isRouteFlood()) {
+      StrHelper::strncpy(ct.mode, "fl", sizeof(ct.mode));
+      ct.hops = pkt->getPathHashCount();
+      formatPath(ct.path, sizeof(ct.path), pkt->path, pkt->path_len, 12);
+      describeRoute(route, sizeof(route), pkt);
+      // They flooded, so whatever path we had to them is suspect: flood the reply and learn
+      // a fresh path from their ACK.
+      if (c && c->out_path_len != OUT_PATH_UNKNOWN) { c->out_path_len = OUT_PATH_UNKNOWN; markContactsDirty(); }
+    } else {
+      StrHelper::strncpy(ct.mode, "dr", sizeof(ct.mode));
+      ct.hops = -1;
+      StrHelper::strncpy(ct.path, "-", sizeof(ct.path));
+      StrHelper::strncpy(route, "along your saved path (reset it to see the route)", sizeof(route));
+    }
+    ct.has_pos = parseCoords(text, ct.lat, ct.lon);
+    StrHelper::strncpy(ct.fix, ct.has_pos ? "man" : "none", sizeof(ct.fix));
+
+    char me[20];
+    sanitizeName(me, sizeof(me), _prefs.node_name);
+    Line R;
+    R.add("%s" CHAT_REPLY_MARK "%lu: %s, %sSNR %.1f", me, (unsigned long)ct.seq, route,
+          ct.hops > 0 || ct.hops < 0 ? "last hop " : "", ct.snr);
+    if (rssiValid(ct.rssi)) R.add(" RSSI %d", (int)lroundf(ct.rssi));
+    StrHelper::strncpy(ct.reply, R.s, sizeof(ct.reply));
+
+    if (c && !(c->flags & 0x01)) { c->flags |= 0x01; markContactsDirty(); }   // keep testers
+
+    StrHelper::strncpy(rx_from, ct.src, sizeof(rx_from));
+    rx_snr = ct.snr; rx_rssi = ct.rssi; rx_hops = ct.hops;
+    StrHelper::strncpy(rx_mode, ct.mode, sizeof(rx_mode));
+    rx_at = millis();
+    rx_count++;
+
+    ct.stage = CT_REPLY;
+    ct.at = millis() + CHAT_SETTLE_MS;
+  }
+
+  // reply -> ask for their position -> log
+  void serviceChatTest() {
+    if (ct.stage == CT_IDLE) return;
+    unsigned long now = millis();
+    if ((long)(now - ct.at) < 0) return;
+    ContactInfo* c = lookupContactByPubKey(ct.key, PUB_KEY_SIZE);
+    if (!c) { finishChatTest(); return; }
+    switch (ct.stage) {
+      case CT_REPLY: {
+        uint32_t ack, est;
+        int rc = sendMessage(*c, getRTCClock()->getCurrentTime(), 0, ct.reply, ack, est);
+        Serial.printf("   -> %s: \"%s\" %s\n", c->name, ct.reply,
+                      rc == MSG_SEND_FAILED ? "FAILED" : rc == MSG_SEND_SENT_FLOOD ? "(flood)" : "(direct)");
+        ct.stage = CT_WAIT_PATH;
+        // after a flooded reply their ACK brings back a path; then the request can go direct
+        ct.at = now + (rc == MSG_SEND_SENT_FLOOD ? CHAT_PATH_WAIT_MS : 3000UL);   // direct: let their ACK pass
+        break;
+      }
+      case CT_WAIT_PATH: {
+        if (ct.has_pos) { finishChatTest(); break; }      // position typed in: no need to ask
+        // MeshCore telemetry request, asking for battery + location only. Their node answers
+        // only if it shares those with us (companion: telemetry mode + this contact's flags).
+        uint8_t req[9] = { CHAT_REQ_TELEMETRY, (uint8_t)~(CHAT_PERM_BASE | CHAT_PERM_LOCATION), 0, 0, 0 };
+        getRNG()->random(&req[5], 4);
+        uint32_t est;
+        int rc = sendRequest(*c, req, sizeof(req), ct.tag, est);
+        if (rc == MSG_SEND_FAILED) { finishChatTest(); break; }
+        Serial.printf("   -> %s: position request %s\n", c->name, rc == MSG_SEND_SENT_FLOOD ? "(flood)" : "(direct)");
+        ct.stage = CT_WAIT_POS;
+        ct.at = now + (rc == MSG_SEND_SENT_FLOOD ? CHAT_TELEM_FLOOD_MS : CHAT_TELEM_DIRECT_MS);
+        break;
+      }
+      case CT_WAIT_POS:
+        Serial.println("   (no position from sender: no reply, or not shared with us)");
+        finishChatTest();
+        break;
+    }
+  }
+
+  void finishChatTest() {
+    if (ct.stage == CT_IDLE) return;
+    char me[20], sk[9];
+    sanitizeName(me, sizeof(me), _prefs.node_name);
+    keyHex(sk, ct.key);
+    Line L;
+    L.add("k=ping v=1 t=%lu src=%s sid=0 sk=%s dst=%s did=%u dk=%s seq=%lu m=%s res=rx via=chat fix=%s hops=%d path=%s",
+          (unsigned long)ct.t, ct.src, sk, me, (unsigned)_prefs.node_id, self_key, (unsigned long)ct.seq,
+          ct.mode, ct.fix, ct.hops, ct.path);
+    L.add(" snr_f=%.2f", ct.snr);
+    if (rssiValid(ct.rssi)) L.add(" rssi_f=%d", (int)lroundf(ct.rssi));
+    L.add(" b=%.2f", ct.batt);
+    if (ct.has_pos) L.add(" lat=%.6f lon=%.6f alt=%d", ct.lat, ct.lon, ct.alt);
+    ct.stage = CT_IDLE;
+    recordEvent(L.s);
+  }
+
   void importCard(const char* cmd) {
     while (*cmd == ' ') cmd++;
     if (memcmp(cmd, "meshcore://", 11) == 0) {
@@ -1476,6 +1726,11 @@ protected:
     formatPath(p, sizeof(p), contact.out_path, contact.out_path_len, 16);
     Serial.printf("PATH to %s: hops=%d path=%s\n", contact.name, (int)(contact.out_path_len & 63), p);
     markContactsDirty();
+    // chat test: our reply's ACK brought a path back, so ask for the position now (direct)
+    if (ct.stage == CT_WAIT_PATH && memcmp(contact.id.pub_key, ct.key, PUB_KEY_SIZE) == 0) {
+      unsigned long soon = millis() + 1000UL;
+      if ((long)(ct.at - soon) > 0) ct.at = soon;
+    }
   }
 
   ContactInfo* processAck(const uint8_t *data) override {
@@ -1488,7 +1743,11 @@ protected:
   }
 
   void onMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
-    if (memcmp(text, MSG_PREFIX, strlen(MSG_PREFIX)) == 0) {
+    if (_prefs.role == ROLE_RECEIVER && !fromRangeNode(text)) {
+      // never logged or posted: the text itself
+      Serial.printf("(%s) MSG from %s: %s\n", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name, text);
+      handleChatTest(from, pkt, text);
+    } else if (memcmp(text, MSG_PREFIX, strlen(MSG_PREFIX)) == 0) {
       Serial.printf("(%s) %s from %s\n", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", MSG_PREFIX, from.name);
       handleRangeMessage(from, pkt, text);
     } else {
@@ -1500,7 +1759,37 @@ protected:
   void onSignedMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const uint8_t *sender_prefix, const char *text) override {}
   void onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t timestamp, const char *text) override {}
   uint8_t onContactRequest(const ContactInfo& contact, uint32_t sender_timestamp, const uint8_t* data, uint8_t len, uint8_t* reply) override { return 0; }
-  void onContactResponse(const ContactInfo& contact, const uint8_t* data, uint8_t len) override {}
+  // Reply to a chat test's position request: [our tag (4)] + Cayenne LPP (battery, GPS, ...).
+  void onContactResponse(const ContactInfo& contact, const uint8_t* data, uint8_t len) override {
+    if (ct.stage != CT_WAIT_POS || len < 4 || memcmp(contact.id.pub_key, ct.key, PUB_KEY_SIZE) != 0
+        || memcmp(data, &ct.tag, 4) != 0) {
+      Serial.printf("   (unmatched response from %s, %u bytes)\n", contact.name, (unsigned)len);
+      return;
+    }
+    LPPReader r(&data[4], len - 4);
+    uint8_t ch, type;
+    bool got_gps = false;
+    while (r.readHeader(ch, type)) {
+      if (type == LPP_GPS && !got_gps) {
+        float lat, lon, alt;
+        if (!r.readGPS(lat, lon, alt)) break;
+        got_gps = true;
+        if (fabsf(lat) >= 0.01f || fabsf(lon) >= 0.01f) {
+          ct.has_pos = true; ct.lat = lat; ct.lon = lon; ct.alt = (int)lroundf(alt);
+          StrHelper::strncpy(ct.fix, "gps", sizeof(ct.fix));
+        }
+      } else if (type == LPP_VOLTAGE && ct.batt == 0) {
+        float v;
+        if (!r.readVoltage(v)) break;
+        ct.batt = v;
+      } else {
+        r.skipData(type);
+      }
+    }
+    if (ct.has_pos) Serial.printf("   %s position: %.5f, %.5f (their GPS)\n", contact.name, ct.lat, ct.lon);
+    else Serial.printf("   %s: %s\n", contact.name, got_gps ? "GPS has no fix" : "no position shared");
+    finishChatTest();
+  }
 
   uint32_t calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const override {
     return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * pkt_airtime_millis);
@@ -1531,6 +1820,8 @@ public:
     nbr_count = 0; nbr_overflow = 0; nbr_window_start = 0;
     memset(&last_fix, 0, sizeof(last_fix)); last_fix_at = 0; has_last_fix = false;
     rx_from[0] = 0; rx_snr = 0; rx_rssi = 0; rx_hops = 0; rx_mode[0] = 0; rx_at = 0; rx_count = 0;
+    memset(&ct, 0, sizeof(ct));
+    memset(chat_gap, 0, sizeof(chat_gap)); chat_gap_next = 0;
     log_bytes = 0; log_lines_boot = 0; log_full = false;
     contacts_save_at = 0;
     has_pending_fav = false;
@@ -2023,6 +2314,7 @@ public:
   void loop() {
     BaseChatMesh::loop();
     serviceSender();
+    serviceChatTest();
 
   #if HAS_WIFI
     serviceWifi();

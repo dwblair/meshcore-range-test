@@ -178,6 +178,37 @@ the key in one of these ways:
   OLED (page 4). The house adds the Rover automatically, and favourites it on the
   first ping.
 
+**Testing from the MeshCore phone app.** Any companion radio works as a pocket tester.
+
+*Setup, once per companion:*
+- Scan `cards/Waltham-qr.png` and `cards/Lincoln-qr.png` in the app to add the houses.
+  The QR codes use the app's `meshcore://contact/add?name=…&public_key=…&type=1` format;
+  the `.txt` cards are for node consoles (`import`).
+- Send a **flood advert** from the app near each house, so the house learns your key.
+  (Or, over USB on the house: `import` the companion's card, e.g. `cards/WFS2.txt`.)
+- To have your position logged automatically, let the companion share it with the
+  houses only. In the app's telemetry settings, set battery and location to *selected
+  contacts*, and allow both for Waltham and Lincoln. With `meshcore-cli`:
+  `set telemetry_mode_base 1`, `set telemetry_mode_loc 1`,
+  `change_flags Waltham 7`, `change_flags Lincoln 7`.
+
+*In the field:* send the house **any message**. Then:
+- **The delivered tick** means the house heard you and its acknowledgement got back.
+- **The house answers in the chat** with how it heard you, e.g.
+  `Waltham got #1752: 2 hops via OwlHill>LEX-Fiske, last hop SNR -4.5 RSSI -112`.
+  If you get the tick but no answer, the link worked one way only.
+- **The house logs the test to Bayou** (never the text). The **Phone tests** panel on
+  the map page lists it, with a marker at your position.
+
+Position comes from the companion's GPS, which the house requests after replying. If
+the companion has no fix, paste coordinates into the message, e.g.
+`42.41208, -71.29789` or `lat=42.41 lon=-71.30`; those win over GPS.
+
+To see the route, **reset the path** to the house in the app before sending. After a
+success the app remembers the path and sends direct, so the house can't see the route
+(the answer then says "along your saved path"). Each house answers a given phone at
+most once every 10 s. Only successes are recorded: the phone can't post its failures.
+
 Carry the Rover around (a USB power bank works). Every 5 minutes, or whenever you
 **long-press PRG** on its main screen, it runs a round: a direct ping, then a routed
 ping, to each house. It logs every result with its GPS position, plus the repeaters it
@@ -224,15 +255,33 @@ copy with `--file`, or preview it with `--dry-run`.
 
 ## The map
 
-`https://bayou.pvos.org/data/<public key>/range/`. It needs the range page added to
-Bayou (`routes/data.js`, `controllers/dataControllers.js`, `views/range.pug`,
-`public/js/range.js`), which is currently **uncommitted in `~/gitwork/bayou`** and
-not yet deployed. To try it locally with simulated data:
+`https://bayou.pvos.org/data/<public key>/range/`. The page lives in Bayou's
+`range-test-page` branch (`routes/data.js`, `controllers/dataControllers.js`,
+`views/range.pug`, `public/js/range.js`), which is deployed on bayou.pvos.org. To try it
+locally with simulated data:
 
 ```bash
 cd ~/gitwork/bayou && ./run_local.sh            # http://localhost:5000
 python3 examples/range_sim.py                     # prints a /range/ URL
 ```
+
+### Clearing the feed
+
+To start over (after desk testing, or before a real deployment), delete every row in
+the feed:
+
+```bash
+curl https://bayou.pvos.org/manage/clear/<public key>/<private key>
+# → "feed cleared of historical data!"   (or "keys don't match!")
+```
+
+This deletes **all** of the feed's measurements: pings, status, adverts and
+neighbour rows. It can't be undone. The feed and its keys stay, so the nodes keep
+posting to it with no changes. Each household re-posts its status within one status
+interval, or at once after a reboot; until then the page shows no households.
+Because the clear is a plain GET, don't paste the URL anywhere that might preview it.
+To keep a copy first, save `https://bayou.pvos.org/data/<public key>/csv/`, which
+returns every row (`/json/` stops at the newest 2000).
 
 ## Serial commands
 
@@ -280,7 +329,11 @@ standard feed pages can chart them.
 - `seq` never repeats for a given sender, even across reboots (each leg of a sender round gets its own), so (`sk`, `seq`, `dk`)
   identifies one attempt.
 - Rows uploaded from a flash log carry `up=1`.
-- People's (chat) nodes are never posted. Only repeaters and room servers are.
+- **Chat tests** (a person messaging a house from the phone app) are `k=ping res=rx` rows
+  posted by the house with `via=chat sid=0`. `seq` comes from the house's counter, `fix` is
+  `gps` (the companion's GPS, requested by the house), `man` (typed into the message) or
+  `none`, and `b` is the companion's battery. The message text is never posted.
+- Adverts from people's (chat) nodes are never posted; only repeaters and room servers are.
 
 Full details are in `~/gitwork/bayou/docs/API.md` §4. The C++ row builder
 (`buildJson` in `main.cpp`) and `tools/range_log_upload.py` must stay in sync.
