@@ -1,6 +1,6 @@
 range_test firmware bundle
-built:          2026-11-17 23:51 UTC
-source commit:  183ae3e (meshcore-range-test, branch range-test-v1)
+built:          2026-11-23 23:49 UTC
+source commit:  4c51897 (meshcore-range-test, branch range-test-v1)
 MeshCore base:  v1.14.1 (from MeshCore-simple-sensor) + Heltec V4.3 front-end detection
 radio default:  910.525 MHz / BW 62.5 kHz / SF7 / CR5 (US preset; change at runtime with 'set radio')
 rook companion: rook repo firmware/v_0.4/rook_companion_radio_ble_v0.4.uf2 (MeshCore v1.15.0)
