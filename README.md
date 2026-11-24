@@ -242,16 +242,43 @@ Short presses of PRG step through the screens: main → Send now → Repeat → 
 (OLED page 3, long press). If the households start reaching each other, their path
 will contain the Rover's hash: the first 2 hex digits of its key, shown in `status`.
 
-Back home, upload the Rover's log, failures included:
+**Uploading the Rover's log.** In the field the Rover keeps every result in its flash
+log, failures included. The houses post only the pings they heard. Back home, copy the
+log to Bayou:
 
-```bash
-pip install pyserial
-python3 tools/range_log_upload.py --port /dev/ttyACM0 --public-key <pub> --private-key <priv>
-# then on the Rover's console:  log clear
-```
+1. Plug the Rover into the laptop over USB, with the firmware running normally (its
+   screen on). Don't hold PRG while plugging in or resetting: that starts the chip's
+   bootloader, and then the port answers nothing. The port then shows up as
+   `303a:1001 USB JTAG/serial debug unit` in `lsusb`, not `heltec_wifi_lora_32 v4`.
+   One press of RST alone gets it back.
+2. Preview, then upload:
 
-The script saves a local copy (`rangelog_<time>.txt`) before posting. Re-post a saved
-copy with `--file`, or preview it with `--dry-run`.
+   ```bash
+   pip install pyserial
+   python3 tools/range_log_upload.py --port /dev/ttyACM0 --public-key <pub> --dry-run
+   python3 tools/range_log_upload.py --port /dev/ttyACM0 --public-key <pub> --private-key <priv>
+   ```
+
+   The script reads the log (`log dump`) and saves a copy, `rangelog_<time>.txt`, in the
+   current folder before posting anything. Git ignores these copies. It skips lines
+   the feed already has: rows the Rover posted itself over Wi-Fi once home, and lines
+   from an earlier upload. A run ends with `done: N posted, 0 failed`.
+3. Once it reports 0 failed, empty the Rover's log so the next upload starts fresh. On
+   its console, run `log clear`. Or add `--clear-after` to the upload, which clears only
+   when every row posted.
+
+Other options:
+- **`--file rangelog_<time>.txt`** re-posts a saved copy; no device needed.
+- **`--since 2026-11-19T01:35`** (UTC) leaves out older lines. Use it when the feed was
+  cleared but the log still holds lines from before. The script prints a note
+  suggesting this when it finds lines older than the feed's first row.
+- **`--all`** posts every line, including ones the feed already has.
+
+The script handles both kinds of USB port. On the V4 (native USB, `/dev/ttyACM0`), the
+board only sends output while DTR is raised, so the script raises it. On the V3 (CP2102
+bridge, `/dev/ttyUSB0`), raising DTR would reset the board, so it stays low. A port
+that prints nothing usually means the bootloader (see step 1) or another program
+holding the port (close any open serial monitor).
 
 ## The map
 
@@ -282,6 +309,10 @@ interval, or at once after a reboot; until then the page shows no households.
 Because the clear is a plain GET, don't paste the URL anywhere that might preview it.
 To keep a copy first, save `https://bayou.pvos.org/data/<public key>/csv/`, which
 returns every row (`/json/` stops at the newest 2000).
+
+The Rover's flash log isn't touched by a clear. Run `log clear` on the Rover too, or the
+next upload will offer those old lines again. If you need lines from that log, upload
+with `--since <time of the clear>` to keep only the newer ones.
 
 ## Serial commands
 

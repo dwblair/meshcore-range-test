@@ -13,6 +13,10 @@ This sends `log dump` to the node, saves the dump to a local file
 Bayou as one row tagged `up=1`. Then, on the node's serial console, run
 `log clear` once you're happy (or pass --clear-after).
 
+Lines the feed already has are skipped (rows the node posted live over Wi-Fi, or an
+earlier upload of the same log); --all posts everything. If the feed was cleared
+while the node's log still held older lines, --since <UTC time> leaves those out.
+
 Re-upload a saved dump (no device needed):
 
     python3 tools/range_log_upload.py --file rangelog_20261117-1530.txt --public-key ... --private-key ...
@@ -25,6 +29,9 @@ examples/range_test/main.cpp.
 """
 
 import argparse
+import csv
+import datetime
+import io
 import json
 import os
 import sys
@@ -35,6 +42,7 @@ import urllib.request
 BEGIN = "--- range log begin"
 END = "--- range log end ---"
 POS_KEYS = ("lat", "lon", "alt")
+TIME_VALID_MIN = 1600000000   # a t= below this is an unset device clock
 
 
 def parse_line(line):
@@ -100,19 +108,45 @@ def line_to_row(line, private_key, mark_uploaded=True):
     return row
 
 
-def dump_from_device(port, timeout):
+# USB-serial bridge chips (CP210x on the Heltec V3, CH34x, FTDI): their DTR/RTS lines drive the
+# ESP32's EN/IO0, so asserting them resets the board.
+BRIDGE_VIDS = {0x10C4, 0x1A86, 0x0403}
+
+
+def open_console(port):
+    """Open a node's serial console without resetting it.
+
+    A USB-serial bridge (V3) resets the board if DTR/RTS move, so both stay low. A board with
+    native USB (V4, nRF52) has no reset wiring, but its USB CDC only sends output while DTR is
+    asserted: with DTR low, `log dump` is accepted and nothing comes back.
+    """
     try:
         import serial  # pyserial
+        from serial.tools import list_ports
     except ImportError:
         sys.exit("pyserial is required for --port:  pip install pyserial")
+
+    info = next((p for p in list_ports.comports() if p.device == os.path.realpath(port) or p.device == port), None)
+    if info is not None and info.vid is not None:
+        bridge = info.vid in BRIDGE_VIDS
+    else:   # no USB info: guess from the name (Linux ttyUSB*, macOS *usbserial*)
+        bridge = "ttyUSB" in port or "usbserial" in port.lower()
 
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = 115200
     ser.timeout = 1
-    ser.dtr = False   # don't reset ESP32 boards on open
-    ser.rts = False
+    if bridge:
+        ser.dtr = False
+        ser.rts = False
+    else:
+        ser.dtr = True
     ser.open()
+    return ser
+
+
+def dump_from_device(port, timeout):
+    ser = open_console(port)
     time.sleep(0.5)
     ser.reset_input_buffer()
     ser.write(b"\r\nlog dump\r\n")
@@ -138,16 +172,59 @@ def dump_from_device(port, timeout):
 
 
 def send_clear(port):
-    import serial
-    ser = serial.Serial()
-    ser.port, ser.baudrate, ser.timeout = port, 115200, 1
-    ser.dtr = ser.rts = False
-    ser.open()
+    ser = open_console(port)
     time.sleep(0.3)
     ser.write(b"\r\nlog clear\r\n")
     time.sleep(1.0)
     print(ser.read(ser.in_waiting or 1).decode("utf-8", errors="replace").strip())
     ser.close()
+
+
+def dup_key(log):
+    """A row's identity for duplicate checks. Bayou keeps `log` without the position keys (the
+    firmware cuts it at ' lat='), uploads add 'up=1', and long lines may be truncated."""
+    return log.split(" lat=")[0].replace(" up=1", "").strip()[:200]
+
+
+def fetch_existing(base_url, public_key):
+    """(dup keys of every row already on the feed, the feed's oldest timestamp or None)."""
+    with urllib.request.urlopen(f"{base_url}/data/{public_key}/csv/", timeout=60) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames or "log" not in reader.fieldnames:
+        raise ValueError("the feed's /csv/ has no log column (wrong public key?)")
+    keys, first = set(), None
+    for r in reader:
+        keys.add(dup_key(r.get("log") or ""))
+        ts = r.get("timestamp")
+        if ts and (first is None or ts < first):
+            first = ts
+    return keys, first
+
+
+def line_times(lines):
+    """Unix time of each line. A t=0 line (clock not set yet, just after boot) takes the time of
+    the next dated line, which comes from the same boot, else of the previous one."""
+    ts = []
+    for line in lines:
+        t = dict(parse_line(line)).get("t", "0")
+        ts.append(int(t) if t.isdigit() and int(t) >= TIME_VALID_MIN else 0)
+    out = []
+    for i, t in enumerate(ts):
+        if not t:
+            t = next((x for x in ts[i + 1:] if x), 0) or next((x for x in reversed(ts[:i]) if x), 0)
+        out.append(t)
+    return out
+
+
+def parse_since(s):
+    """'2026-11-19', '2026-11-19T01:35' (UTC) or unix seconds -> unix seconds."""
+    if s.isdigit():
+        return int(s)
+    d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return int(d.timestamp())
 
 
 def post_row(url, row):
@@ -173,6 +250,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the rows instead of posting")
     ap.add_argument("--timeout", type=float, default=10, help="serial read timeout (s)")
     ap.add_argument("--clear-after", action="store_true", help="send 'log clear' to the node if every row posted OK")
+    ap.add_argument("--all", action="store_true",
+                    help="post every line, even ones the feed already has (default: skip those)")
+    ap.add_argument("--since", help="skip lines dated before this UTC time (e.g. 2026-11-19T01:35), "
+                    "for a log that predates the last time the feed was cleared")
     args = ap.parse_args()
 
     if not args.dry_run and not (args.public_key and args.private_key):
@@ -191,11 +272,41 @@ def main():
             lines = [l.strip() for l in f if l.strip().startswith("k=")]
         complete = True
 
+    base = args.url.rstrip("/")
+    times = dict(zip(range(len(lines)), line_times(lines)))   # dated from the whole log, before any filtering
+    idx = list(range(len(lines)))
+    if args.since and idx:
+        since = parse_since(args.since)
+        kept = [i for i in idx if times[i] >= since]
+        print(f"skipping {len(idx) - len(kept)} lines dated before {args.since}")
+        idx = kept
+
+    if idx and not args.all and args.public_key:
+        try:
+            have, first = fetch_existing(base, args.public_key)
+        except (OSError, ValueError) as e:
+            sys.exit(f"couldn't read the feed to skip rows it already has: {e}\n"
+                     "check --public-key, or pass --all to post everything")
+        kept = []
+        for i in idx:
+            row = line_to_row(lines[i], "")
+            if row is None or dup_key(row["log"]) not in have:
+                kept.append(i)
+        print(f"skipping {len(idx) - len(kept)} lines the feed already has")
+        idx = kept
+        if first and not args.since:
+            first_t = parse_since(first)
+            older = sum(1 for i in idx if times[i] and times[i] < first_t)
+            if older:
+                print(f"note: {older} of the remaining lines are older than the feed's first row ({first}). "
+                      f"If the feed was cleared after them, re-run with --since {first[:16]} to leave them out.")
+    lines = [lines[i] for i in idx]
+
     if not lines:
         print("nothing to upload")
         return
 
-    url = f"{args.url.rstrip('/')}/data/{args.public_key}"
+    url = f"{base}/data/{args.public_key}"
     ok = fail = 0
     for i, line in enumerate(lines, 1):
         row = line_to_row(line, args.private_key or "PRIVATE_KEY")
